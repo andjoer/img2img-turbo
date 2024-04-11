@@ -5,7 +5,8 @@ import copy
 from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer, CLIPTextModel
-from diffusers import AutoencoderKL, UNet2DConditionModel
+from diffusers import AutoencoderKL
+from diffusers import UNet2DConditionModel
 from diffusers.utils.peft_utils import set_weights_and_activate_adapters
 from peft import LoraConfig
 p = "src/"
@@ -27,22 +28,34 @@ class TwinConv(torch.nn.Module):
 
 
 class Pix2Pix_Turbo(torch.nn.Module):
-    def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_unet=8, lora_rank_vae=4,device="mps"):
+    def __init__(self, model_name= "stabilityai/sd-turbo",pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_unet=8, lora_rank_vae=4,device="mps"):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").to(device)
-        self.sched = make_1step_sched()
-        self.device = device
-        vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
+        self.model_name = model_name
+        if model_name == "stabilityai/sd-turbo":
+            self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
+            self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").to(device)
+            self.sched = make_1step_sched(model_name, device)
+            self.device = device
+            vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
+        elif model_name == "stabilityai/stable-diffusion-xl-base-1.0":
+            print('###using stable diffusion xl')
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, subfolder="tokenizer")
+            self.text_encoder = CLIPTextModel.from_pretrained(model_name, subfolder="text_encoder").to(device)
+            self.sched = make_1step_sched(model_name, device)
+            self.device = device
+            vae = AutoencoderKL.from_pretrained(model_name, subfolder="vae")
+
+        else:
+            raise NotImplementedError(f"Model {self.model_name} not implemented")
         vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
         vae.decoder.forward = my_vae_decoder_fwd.__get__(vae.decoder, vae.decoder.__class__)
-        # add the skip connection convs
+        #add the skip connection convs
         vae.decoder.skip_conv_1 = torch.nn.Conv2d(512, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device)
         vae.decoder.skip_conv_2 = torch.nn.Conv2d(256, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device)
         vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device)
         vae.decoder.skip_conv_4 = torch.nn.Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device)
         vae.decoder.ignore_skip = False
-        unet = UNet2DConditionModel.from_pretrained("stabilityai/sd-turbo", subfolder="unet")
+        unet = UNet2DConditionModel.from_pretrained(model_name, subfolder="unet")
 
         if pretrained_name == "edge_to_image":
             url = "https://www.cs.cmu.edu/~img2img-turbo/models/edge_to_image_loras.pkl"
@@ -140,7 +153,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
             ]
             vae_lora_config = LoraConfig(r=lora_rank_vae, init_lora_weights="gaussian",
                 target_modules=target_modules_vae)
-            vae.add_adapter(vae_lora_config, adapter_name="vae_skip")
+            #vae.add_adapter(vae_lora_config, adapter_name="vae_skip")
             target_modules_unet = [
                 "to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2", "conv_shortcut", "conv_out",
                 "proj_in", "proj_out", "ff.net.2", "ff.net.0.proj"
@@ -183,20 +196,51 @@ class Pix2Pix_Turbo(torch.nn.Module):
         self.vae.decoder.skip_conv_3.requires_grad_(True)
         self.vae.decoder.skip_conv_4.requires_grad_(True)
 
-    def forward(self, c_t, prompt=None, prompt_tokens=None, deterministic=True, r=1.0, noise_map=None):
-        # either the prompt or the prompt_tokens should be provided
-        assert (prompt is None) != (prompt_tokens is None), "Either prompt or prompt_tokens should be provided"
 
-        if prompt is not None:
-            # encode the text prompt
-            caption_tokens = self.tokenizer(prompt, max_length=self.tokenizer.model_max_length,
-                                            padding="max_length", truncation=True, return_tensors="pt").input_ids.to(self.device)
-            caption_enc = self.text_encoder(caption_tokens)[0]
-        else:
-            caption_enc = self.text_encoder(prompt_tokens)[0]
+    def compute_time_ids(self,bs):
+        crops_coords_top_left_h = 0
+        crops_coords_top_left_w = 0 
+        resolution = 512
+        crops_coords_top_left = (crops_coords_top_left_h, crops_coords_top_left_w)
+
+        original_size = target_size = (resolution, resolution)
+
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+
+        add_time_ids = torch.tensor([add_time_ids])
+
+        return add_time_ids.to(self.device).repeat(bs, 1)
+
+    
+
+    def forward(self, c_t, prompt=None, prompt_tokens=None, caption_enc=None, caption_enc_pooled=None, deterministic=True, r=1.0, noise_map=None):
+        # either the prompt or the prompt_tokens should be provided
+        #assert ((prompt is None) != (prompt_tokens is None)), "Either prompt or prompt_tokens should be provided"
+
+        if caption_enc is None:
+            if prompt is not None:
+                # encode the text prompt
+                caption_tokens = self.tokenizer(prompt, max_length=self.tokenizer.model_max_length,
+                                                padding="max_length", truncation=True, return_tensors="pt").input_ids.to(self.device)
+                caption_enc = self.text_encoder(caption_tokens)[0]
+
+                caption_enc_pooled = caption_enc[0]
+            else:
+
+                caption_enc = self.text_encoder(prompt_tokens)[0]
+
+        else: 
+            add_time_ids = self.compute_time_ids(bs = caption_enc.shape[0]) 
+            added_cond_kwargs = {"text_embeds": caption_enc_pooled, "time_ids": add_time_ids}
+        
         if deterministic:
+
             encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
-            model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc,).sample
+            
+            if caption_enc is None: 
+                model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc).sample
+            else:
+                model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc,added_cond_kwargs=added_cond_kwargs).sample
             x_denoised = self.sched.step(model_pred, self.timesteps, encoded_control, return_dict=True).prev_sample
             self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
             output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)

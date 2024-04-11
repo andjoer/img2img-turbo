@@ -21,13 +21,44 @@ import wandb
 from cleanfid.fid import get_folder_features, build_feature_extractor, fid_from_feats
 
 from pix2pix_turbo import Pix2Pix_Turbo
-from my_utils.training_utils import parse_args_paired_training, PairedDataset
-
+from my_utils.training_utils import parse_args_paired_training, PairedDataset, PairedDatasetSDXL
+from transformers import AutoTokenizer, PretrainedConfig
 import vision_aided_loss
+from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_instruct_pix2pix import (
+    StableDiffusionXLInstructPix2PixPipeline,
+)
+from diffusers.utils.torch_utils import is_compiled_module
 
+def import_model_class_from_model_name_or_path(
+    pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
+):
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path, subfolder=subfolder, revision=revision
+    )
+    model_class = text_encoder_config.architectures[0]
+
+    if model_class == "CLIPTextModel":
+        from transformers import CLIPTextModel
+
+        return CLIPTextModel
+    elif model_class == "CLIPTextModelWithProjection":
+        from transformers import CLIPTextModelWithProjection
+
+        return CLIPTextModelWithProjection
+    else:
+        raise ValueError(f"{model_class} is not supported.")
+def unwrap_model(model):
+    model = accelerator.unwrap_model(model)
+    model = model._orig_mod if is_compiled_module(model) else model
+    return model
 
 def main(args):
-  
+
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -48,9 +79,9 @@ def main(args):
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
 
-    if args.pretrained_model_name_or_path == "stabilityai/sd-turbo":
-        net_pix2pix = Pix2Pix_Turbo(lora_rank_unet=args.lora_rank_unet, lora_rank_vae=args.lora_rank_vae,device=accelerator.device)
-        net_pix2pix.set_train()
+
+    net_pix2pix = Pix2Pix_Turbo(model_name = args.pretrained_model_name_or_path,lora_rank_unet=args.lora_rank_unet, lora_rank_vae=args.lora_rank_vae,device=accelerator.device)
+    net_pix2pix.set_train()
 
     if args.enable_xformers_memory_efficient_attention and "mps" not in str(accelerator.device):
         if is_xformers_available():
@@ -114,9 +145,53 @@ def main(args):
             num_training_steps=args.max_train_steps * accelerator.num_processes,
             num_cycles=args.lr_num_cycles, power=args.lr_power)
 
-    dataset_train = PairedDataset(dataset_folder=args.dataset_folder, image_prep=args.train_image_prep, split="train", tokenizer=net_pix2pix.tokenizer)
+    if args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-xl-base-1.0":
+        revision = None
+        variant = None
+        pretrained_model_name_or_path="stabilityai/stable-diffusion-xl-base-1.0"
+        tokenizer_1 = AutoTokenizer.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            subfolder="tokenizer",
+            revision=revision,
+            use_fast=False,
+        )
+        tokenizer_2 = AutoTokenizer.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            subfolder="tokenizer_2",
+            revision=revision,
+            use_fast=False,
+        )
+        text_encoder_cls_1 = import_model_class_from_model_name_or_path(pretrained_model_name_or_path, revision)
+        text_encoder_cls_2 = import_model_class_from_model_name_or_path(
+            pretrained_model_name_or_path, revision, subfolder="text_encoder_2"
+        )
+
+        text_encoder_1 = text_encoder_cls_1.from_pretrained(
+            pretrained_model_name_or_path, subfolder="text_encoder", revision=revision, variant=variant
+        )
+        text_encoder_2 = text_encoder_cls_2.from_pretrained(
+            pretrained_model_name_or_path, subfolder="text_encoder_2", revision=revision, variant=variant
+        )
+
+        # We ALWAYS pre-compute the additional condition embeddings needed for SDXL
+        # UNet as the model is already big and it uses two text encoders.
+        text_encoder_1.to(accelerator.device)
+        text_encoder_2.to(accelerator.device)
+        tokenizers = [tokenizer_1, tokenizer_2]
+        text_encoders = [text_encoder_1, text_encoder_2]
+
+        # Freeze vae and text_encoders
+        text_encoder_1.requires_grad_(False)
+        text_encoder_2.requires_grad_(False)
+        dataset_train = PairedDatasetSDXL(dataset_folder=args.dataset_folder, image_prep=args.train_image_prep, split="train", tokenizers=tokenizers,text_encoders=text_encoders)
+        dataset_val = PairedDatasetSDXL(dataset_folder=args.dataset_folder, image_prep=args.test_image_prep, split="test", tokenizers=tokenizers,text_encoders=text_encoders)
+        
+
+    else: 
+        dataset_val = PairedDataset(dataset_folder=args.dataset_folder, image_prep=args.test_image_prep, split="test", tokenizer=net_pix2pix.tokenizer)
+        dataset_train = PairedDataset(dataset_folder=args.dataset_folder, image_prep=args.train_image_prep, split="train", tokenizer=net_pix2pix.tokenizer)
+
     dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
-    dataset_val = PairedDataset(dataset_folder=args.dataset_folder, image_prep=args.test_image_prep, split="test", tokenizer=net_pix2pix.tokenizer)
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
 
     # Prepare everything with our `accelerator`.
@@ -175,7 +250,10 @@ def main(args):
                 x_tgt = batch["output_pixel_values"]
                 B, C, H, W = x_src.shape
                 # forward pass
-                x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
+                if args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-xl-base-1.0":
+                    x_tgt_pred = net_pix2pix(x_src, caption_enc=batch["prompt_embeds"], caption_enc_pooled=batch["add_text_embeds"], deterministic=True)
+                else:
+                    x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
                 # Reconstruction loss
                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
                 loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
@@ -205,7 +283,11 @@ def main(args):
                 """
                 Generator loss: fool the discriminator
                 """
-                x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
+                if args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-xl-base-1.0":
+
+                    x_tgt_pred = net_pix2pix(x_src, caption_enc=batch["prompt_embeds"], caption_enc_pooled=batch["add_text_embeds"], deterministic=True)
+                else:
+                    x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
                 lossG = net_disc(x_tgt_pred_resized, for_G=True).mean() * args.lambda_gan
 
                 accelerator.backward(lossG)
@@ -270,7 +352,7 @@ def main(args):
                         accelerator.unwrap_model(net_pix2pix).save_model(outf)
 
                     # compute validation set FID, L2, LPIPS, CLIP-SIM
-                    if global_step % args.eval_freq == 1:
+                    if global_step % args.eval_freq == 1:# and global_step > 200:
                         l_l2, l_lpips, l_clipsim = [], [], []
                         if args.track_val_fid:
                             os.makedirs(os.path.join(args.output_dir, "eval", f"fid_{global_step}"), exist_ok=True)
@@ -283,7 +365,11 @@ def main(args):
                             assert B == 1, "Use batch size 1 for eval."
                             with torch.no_grad():
                                 # forward pass
-                                x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, prompt_tokens=batch_val["input_ids"].to(accelerator.device), deterministic=True)
+                                if args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-xl-base-1.0":
+                                    x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, caption_enc=batch_val["prompt_embeds"].to(accelerator.device), caption_enc_pooled=batch_val["add_text_embeds"].to(accelerator.device), deterministic=True)
+                                else:
+                                    x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, prompt_tokens=batch_val["input_ids"].to(accelerator.device), deterministic=True)
+
                                 # compute the reconstruction losses
                                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean")
                                 loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean()
