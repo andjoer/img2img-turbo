@@ -31,7 +31,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").to(device)
-        self.sched = make_1step_sched()
+        self.sched = make_1step_sched("stabilityai/sd-turbo",device)
         self.device = device
         vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
         vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
