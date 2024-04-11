@@ -23,8 +23,11 @@ from cleanfid.fid import get_folder_features, build_feature_extractor, fid_from_
 from pix2pix_turbo import Pix2Pix_Turbo
 from my_utils.training_utils import parse_args_paired_training, PairedDataset
 
+import vision_aided_loss
+
 
 def main(args):
+  
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -46,10 +49,10 @@ def main(args):
         os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
 
     if args.pretrained_model_name_or_path == "stabilityai/sd-turbo":
-        net_pix2pix = Pix2Pix_Turbo(lora_rank_unet=args.lora_rank_unet, lora_rank_vae=args.lora_rank_vae)
+        net_pix2pix = Pix2Pix_Turbo(lora_rank_unet=args.lora_rank_unet, lora_rank_vae=args.lora_rank_vae,device=accelerator.device)
         net_pix2pix.set_train()
 
-    if args.enable_xformers_memory_efficient_attention:
+    if args.enable_xformers_memory_efficient_attention and "mps" not in str(accelerator.device):
         if is_xformers_available():
             net_pix2pix.unet.enable_xformers_memory_efficient_attention()
         else:
@@ -63,17 +66,17 @@ def main(args):
 
     if args.gan_disc_type == "vagan_clip":
         import vision_aided_loss
-        net_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="cuda")
+        net_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="mps")
     else:
         raise NotImplementedError(f"Discriminator type {args.gan_disc_type} not implemented")
 
-    net_disc = net_disc.cuda()
+    net_disc = net_disc.to(accelerator.device)
     net_disc.requires_grad_(True)
     net_disc.cv_ensemble.requires_grad_(False)
     net_disc.train()
 
-    net_lpips = lpips.LPIPS(net='vgg').cuda()
-    net_clip, _ = clip.load("ViT-B/32", device="cuda")
+    net_lpips = lpips.LPIPS(net='vgg').to(accelerator.device)
+    net_clip, _ = clip.load("ViT-B/32", device=accelerator.device)
     net_clip.requires_grad_(False)
     net_clip.eval()
 
@@ -151,7 +154,7 @@ def main(args):
 
     # compute the reference stats for FID tracking
     if accelerator.is_main_process and args.track_val_fid:
-        feat_model = build_feature_extractor("clean", "cuda", use_dataparallel=False)
+        feat_model = build_feature_extractor("clean", accelerator.device, use_dataparallel=False)
 
         def fn_transform(x):
             x_pil = Image.fromarray(x)
@@ -159,7 +162,7 @@ def main(args):
             return np.array(out_pil)
 
         ref_stats = get_folder_features(os.path.join(args.dataset_folder, "test_B"), model=feat_model, num_workers=0, num=None,
-                shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
+                shuffle=False, seed=0, batch_size=8, device=torch.device(accelerator.device),
                 mode="clean", custom_image_tranform=fn_transform, description="", verbose=True)
 
     # start the training loop
@@ -177,6 +180,7 @@ def main(args):
                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
                 loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
                 loss = loss_l2 + loss_lpips
+
                 # CLIP similarity loss
                 if args.lambda_clipsim > 0:
                     x_tgt_pred_renorm = t_clip_renorm(x_tgt_pred * 0.5 + 0.5)
@@ -192,11 +196,18 @@ def main(args):
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
 
+                if "mps" in str(accelerator.device):    # size needs to be dividable by 224
+                    x_tgt_resized = F.interpolate(x_tgt, size=(448, 448), mode='bilinear')
+                    x_tgt_pred_resized = F.interpolate(x_tgt, size=(448, 448), mode='bilinear')
+                else: 
+                    x_tgt_resized = x_tgt
+                    x_tgt_pred_resized = x_tgt_pred
                 """
                 Generator loss: fool the discriminator
                 """
                 x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
-                lossG = net_disc(x_tgt_pred, for_G=True).mean() * args.lambda_gan
+                lossG = net_disc(x_tgt_pred_resized, for_G=True).mean() * args.lambda_gan
+
                 accelerator.backward(lossG)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(layers_to_opt, args.max_grad_norm)
@@ -204,11 +215,13 @@ def main(args):
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
 
+                
                 """
                 Discriminator loss: fake image vs real image
                 """
                 # real image
-                lossD_real = net_disc(x_tgt.detach(), for_real=True).mean() * args.lambda_gan
+                lossD_real = net_disc(x_tgt_resized.detach(), for_real=True).mean() * args.lambda_gan
+
                 accelerator.backward(lossD_real.mean())
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(net_disc.parameters(), args.max_grad_norm)
@@ -216,13 +229,14 @@ def main(args):
                 lr_scheduler_disc.step()
                 optimizer_disc.zero_grad(set_to_none=args.set_grads_to_none)
                 # fake image
-                lossD_fake = net_disc(x_tgt_pred.detach(), for_real=False).mean() * args.lambda_gan
+                lossD_fake = net_disc(x_tgt_pred_resized.detach(), for_real=False).mean() * args.lambda_gan
                 accelerator.backward(lossD_fake.mean())
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(net_disc.parameters(), args.max_grad_norm)
                 optimizer_disc.step()
                 optimizer_disc.zero_grad(set_to_none=args.set_grads_to_none)
                 lossD = lossD_real + lossD_fake
+
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -263,13 +277,13 @@ def main(args):
                         for step, batch_val in enumerate(dl_val):
                             if step >= args.num_samples_eval:
                                 break
-                            x_src = batch_val["conditioning_pixel_values"].cuda()
-                            x_tgt = batch_val["output_pixel_values"].cuda()
+                            x_src = batch_val["conditioning_pixel_values"].to(accelerator.device)
+                            x_tgt = batch_val["output_pixel_values"].to(accelerator.device)
                             B, C, H, W = x_src.shape
                             assert B == 1, "Use batch size 1 for eval."
                             with torch.no_grad():
                                 # forward pass
-                                x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, prompt_tokens=batch_val["input_ids"].cuda(), deterministic=True)
+                                x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, prompt_tokens=batch_val["input_ids"].to(accelerator.device), deterministic=True)
                                 # compute the reconstruction losses
                                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean")
                                 loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean()
@@ -290,7 +304,7 @@ def main(args):
                                 output_pil.save(outf)
                         if args.track_val_fid:
                             curr_stats = get_folder_features(os.path.join(args.output_dir, "eval", f"fid_{global_step}"), model=feat_model, num_workers=0, num=None,
-                                    shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
+                                    shuffle=False, seed=0, batch_size=8, device=torch.device(accelerator.device),
                                     mode="clean", custom_image_tranform=fn_transform, description="", verbose=True)
                             fid_score = fid_from_feats(ref_stats, curr_stats)
                             logs["val/clean_fid"] = fid_score
@@ -298,7 +312,12 @@ def main(args):
                         logs["val/lpips"] = np.mean(l_lpips)
                         logs["val/clipsim"] = np.mean(l_clipsim)
                         gc.collect()
-                        torch.cuda.empty_cache()
+
+                        if "mps" in str(accelerator.device):
+                            torch.mps.empty_cache()
+
+                        elif "cuda" in str(accelerator.device):
+                            torch.cuda.empty_cache()
                     accelerator.log(logs, step=global_step)
 
 
