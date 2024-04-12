@@ -119,6 +119,10 @@ def main(args):
     dataset_val = PairedDataset(dataset_folder=args.dataset_folder, image_prep=args.test_image_prep, split="test", tokenizer=net_pix2pix.tokenizer)
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
 
+    if "mps" in str(accelerator.device):    # size needs to be dividable by 224
+        resize_to_opt = [224,448,672,896,1120]
+        image_size = dataset_train[0]["conditioning_pixel_values"].size()[-1]
+        resize_to = max([num for num in resize_to_opt if num < image_size])
     # Prepare everything with our `accelerator`.
     net_pix2pix, net_disc, optimizer, optimizer_disc, dl_train, lr_scheduler, lr_scheduler_disc = accelerator.prepare(
         net_pix2pix, net_disc, optimizer, optimizer_disc, dl_train, lr_scheduler, lr_scheduler_disc
@@ -197,8 +201,8 @@ def main(args):
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
 
                 if "mps" in str(accelerator.device):    # size needs to be dividable by 224
-                    x_tgt_resized = F.interpolate(x_tgt, size=(448, 448), mode='bilinear')
-                    x_tgt_pred_resized = F.interpolate(x_tgt, size=(448, 448), mode='bilinear')
+                    x_tgt_resized = F.interpolate(x_tgt, size=(resize_to, resize_to), mode='bilinear')
+                    x_tgt_pred_resized = F.interpolate(x_tgt, size=(resize_to, resize_to), mode='bilinear')
                 else: 
                     x_tgt_resized = x_tgt
                     x_tgt_pred_resized = x_tgt_pred

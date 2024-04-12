@@ -20,21 +20,24 @@ from model import make_1step_sched
 from cyclegan_turbo import CycleGAN_Turbo, VAE_encode, VAE_decode, initialize_unet, initialize_vae
 from my_utils.training_utils import UnpairedDataset, build_transform, parse_args_unpaired_training
 from my_utils.dino_struct import DinoStructureLoss
-
+from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd, download_url
+import torch.nn.functional as F
 
 def main(args):
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, log_with=args.report_to)
     set_seed(args.seed)
+    model = "stabilityai/sd-turbo"
 
+    
     if accelerator.is_main_process:
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer", revision=args.revision, use_fast=False,)
-    noise_scheduler_1step = make_1step_sched()
-    text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").cuda()
+    noise_scheduler_1step = make_1step_sched(model=model,device=accelerator.device)
+    text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").to(accelerator.device)
 
     unet, l_modules_unet_encoder, l_modules_unet_decoder, l_modules_unet_others = initialize_unet(args.lora_rank_unet, return_lora_module_names=True)
-    vae_a2b, vae_lora_target_modules = initialize_vae(args.lora_rank_vae, return_lora_module_names=True)
+    vae_a2b, vae_lora_target_modules = initialize_vae(args.lora_rank_vae, return_lora_module_names=True,device=accelerator.device)
 
     weight_dtype = torch.float32
     vae_a2b.to(accelerator.device, dtype=weight_dtype)
@@ -43,9 +46,9 @@ def main(args):
     text_encoder.requires_grad_(False)
 
     if args.gan_disc_type == "vagan_clip":
-        net_disc_a = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="cuda")
+        net_disc_a = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device=accelerator.device)
         net_disc_a.cv_ensemble.requires_grad_(False)  # Freeze feature extractor
-        net_disc_b = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="cuda")
+        net_disc_b = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device=accelerator.device)
         net_disc_b.cv_ensemble.requires_grad_(False)  # Freeze feature extractor
 
     crit_cycle, crit_idt = torch.nn.L1Loss(), torch.nn.L1Loss()
@@ -78,6 +81,13 @@ def main(args):
     T_val = build_transform(args.val_img_prep)
     fixed_caption_src = dataset_train.fixed_caption_src
     fixed_caption_tgt = dataset_train.fixed_caption_tgt
+
+    if "mps" in str(accelerator.device):    # size needs to be dividable by 224
+            resize_to_opt = [224,448,672,896,1120]
+
+            image_size = dataset_train[0]["pixel_values_src"].size()[-1]
+            resize_to = max([num for num in resize_to_opt if num < image_size])
+
     l_images_src_test = []
     for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp"]:
         l_images_src_test.extend(glob(os.path.join(args.dataset_folder, "test_A", ext)))
@@ -88,7 +98,7 @@ def main(args):
 
     # make the reference FID statistics
     if accelerator.is_main_process:
-        feat_model = build_feature_extractor("clean", "cuda", use_dataparallel=False)
+        feat_model = build_feature_extractor("clean", accelerator.device, use_dataparallel=False)
         """
         FID reference statistics for A -> B translation
         """
@@ -102,7 +112,7 @@ def main(args):
                 _img.save(outf)
         # compute the features for the reference images
         ref_features = get_folder_features(output_dir_ref, model=feat_model, num_workers=0, num=None,
-                        shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
+                        shuffle=False, seed=0, batch_size=8, device=torch.device(accelerator.device),
                         mode="clean", custom_fn_resize=None, description="", verbose=True,
                         custom_image_tranform=None)
         a2b_ref_mu, a2b_ref_sigma = np.mean(ref_features, axis=0), np.cov(ref_features, rowvar=False)
@@ -119,7 +129,7 @@ def main(args):
                 _img.save(outf)
         # compute the features for the reference images
         ref_features = get_folder_features(output_dir_ref, model=feat_model, num_workers=0, num=None,
-                        shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
+                        shuffle=False, seed=0, batch_size=8, device=torch.device(accelerator.device),
                         mode="clean", custom_fn_resize=None, description="", verbose=True,
                         custom_image_tranform=None)
         b2a_ref_mu, b2a_ref_sigma = np.mean(ref_features, axis=0), np.cov(ref_features, rowvar=False)
@@ -134,13 +144,13 @@ def main(args):
         num_cycles=args.lr_num_cycles, power=args.lr_power)
 
     net_lpips = lpips.LPIPS(net='vgg')
-    net_lpips.cuda()
+    net_lpips.to(accelerator.device)
     net_lpips.requires_grad_(False)
 
     fixed_a2b_tokens = tokenizer(fixed_caption_tgt, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt").input_ids[0]
-    fixed_a2b_emb_base = text_encoder(fixed_a2b_tokens.cuda().unsqueeze(0))[0].detach()
+    fixed_a2b_emb_base = text_encoder(fixed_a2b_tokens.to(accelerator.device).unsqueeze(0))[0].detach()
     fixed_b2a_tokens = tokenizer(fixed_caption_src, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt").input_ids[0]
-    fixed_b2a_emb_base = text_encoder(fixed_b2a_tokens.cuda().unsqueeze(0))[0].detach()
+    fixed_b2a_emb_base = text_encoder(fixed_b2a_tokens.to(accelerator.device).unsqueeze(0))[0].detach()
     del text_encoder, tokenizer  # free up some memory
 
     unet, vae_enc, vae_dec, net_disc_a, net_disc_b = accelerator.prepare(unet, vae_enc, vae_dec, net_disc_a, net_disc_b)
@@ -195,13 +205,21 @@ def main(args):
                 lr_scheduler_gen.step()
                 optimizer_gen.zero_grad()
 
+                
+
                 """
                 Generator Objective (GAN) for task a->b and b->a (fake inputs)
                 """
                 fake_a = CycleGAN_Turbo.forward_with_networks(img_b, "b2a", vae_enc, unet, vae_dec, noise_scheduler_1step, timesteps, fixed_b2a_emb)
                 fake_b = CycleGAN_Turbo.forward_with_networks(img_a, "a2b", vae_enc, unet, vae_dec, noise_scheduler_1step, timesteps, fixed_a2b_emb)
-                loss_gan_a = net_disc_a(fake_b, for_G=True).mean() * args.lambda_gan
-                loss_gan_b = net_disc_b(fake_a, for_G=True).mean() * args.lambda_gan
+                if "mps" in str(accelerator.device):    # size needs to be dividable by 224
+                    fake_a_resized = F.interpolate(fake_a, size=(resize_to, resize_to), mode='bilinear')
+                    fake_b_resized = F.interpolate(fake_b, size=(resize_to, resize_to), mode='bilinear')
+                else: 
+                    fake_a_resized  = fake_a
+                    fake_b_resized  = fake_b
+                loss_gan_a = net_disc_a(fake_b_resized, for_G=True).mean() * args.lambda_gan
+                loss_gan_b = net_disc_b(fake_a_resized, for_G=True).mean() * args.lambda_gan
                 accelerator.backward(loss_gan_a + loss_gan_b, retain_graph=False)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(params_gen, args.max_grad_norm)
@@ -229,8 +247,14 @@ def main(args):
                 """
                 Discriminator for task a->b and b->a (fake inputs)
                 """
-                loss_D_A_fake = net_disc_a(fake_b.detach(), for_real=False).mean() * args.lambda_gan
-                loss_D_B_fake = net_disc_b(fake_a.detach(), for_real=False).mean() * args.lambda_gan
+                if "mps" in str(accelerator.device):    # size needs to be dividable by 224
+                    fake_a_resized = F.interpolate(fake_a, size=(resize_to, resize_to), mode='bilinear')
+                    fake_b_resized = F.interpolate(fake_b, size=(resize_to, resize_to), mode='bilinear')
+                else: 
+                    fake_a_resized  = fake_a
+                    fake_b_resized  = fake_b
+                loss_D_A_fake = net_disc_a(fake_b_resized.detach(), for_real=False).mean() * args.lambda_gan
+                loss_D_B_fake = net_disc_b(fake_a_resized.detach(), for_real=False).mean() * args.lambda_gan
                 loss_D_fake = (loss_D_A_fake + loss_D_B_fake) * 0.5
                 accelerator.backward(loss_D_fake, retain_graph=False)
                 if accelerator.sync_gradients:
@@ -243,8 +267,14 @@ def main(args):
                 """
                 Discriminator for task a->b and b->a (real inputs)
                 """
-                loss_D_A_real = net_disc_a(img_b, for_real=True).mean() * args.lambda_gan
-                loss_D_B_real = net_disc_b(img_a, for_real=True).mean() * args.lambda_gan
+                if "mps" in str(accelerator.device):    # size needs to be dividable by 224
+                    img_a_resized = F.interpolate(img_a, size=(resize_to, resize_to), mode='bilinear')
+                    img_b_resized = F.interpolate(img_b, size=(resize_to, resize_to), mode='bilinear')
+                else: 
+                    img_a_resized  = img_a
+                    img_b_resized  = img_b
+                loss_D_A_real = net_disc_a(img_b_resized, for_real=True).mean() * args.lambda_gan
+                loss_D_B_real = net_disc_b(img_a_resized, for_real=True).mean() * args.lambda_gan
                 loss_D_real = (loss_D_A_real + loss_D_B_real) * 0.5
                 accelerator.backward(loss_D_real, retain_graph=False)
                 if accelerator.sync_gradients:
@@ -287,7 +317,11 @@ def main(args):
                                 log_dict["train/fake_a"] = [wandb.Image(fake_a[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(bsz)]
                                 tracker.log(log_dict)
                                 gc.collect()
-                                torch.cuda.empty_cache()
+                                if "mps" in str(accelerator.device):
+                                    torch.mps.empty_cache()
+
+                                elif "cuda" in str(accelerator.device):
+                                    torch.cuda.empty_cache()
 
                     if global_step % args.checkpointing_steps == 1:
                         outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
@@ -305,12 +339,16 @@ def main(args):
                         sd["sd_vae_dec"] = eval_vae_dec.state_dict()
                         torch.save(sd, outf)
                         gc.collect()
-                        torch.cuda.empty_cache()
+                        if "mps" in str(accelerator.device):
+                            torch.mps.empty_cache()
+
+                        elif "cuda" in str(accelerator.device):
+                            torch.cuda.empty_cache()
 
                     # compute val FID and DINO-Struct scores
                     if global_step % args.validation_steps == 1:
-                        _timesteps = torch.tensor([noise_scheduler_1step.config.num_train_timesteps - 1] * 1, device="cuda").long()
-                        net_dino = DinoStructureLoss()
+                        _timesteps = torch.tensor([noise_scheduler_1step.config.num_train_timesteps - 1] * 1, device=accelerator.device).long()
+                        net_dino = DinoStructureLoss(device=accelerator.device)
                         """
                         Evaluate "A->B"
                         """
@@ -325,18 +363,18 @@ def main(args):
                             with torch.no_grad():
                                 input_img = T_val(Image.open(input_img_path).convert("RGB"))
                                 img_a = transforms.ToTensor()(input_img)
-                                img_a = transforms.Normalize([0.5], [0.5])(img_a).unsqueeze(0).cuda()
+                                img_a = transforms.Normalize([0.5], [0.5])(img_a).unsqueeze(0).to(accelerator.device)
                                 eval_fake_b = CycleGAN_Turbo.forward_with_networks(img_a, "a2b", eval_vae_enc, eval_unet,
                                     eval_vae_dec, noise_scheduler_1step, _timesteps, fixed_a2b_emb[0:1])
                                 eval_fake_b_pil = transforms.ToPILImage()(eval_fake_b[0] * 0.5 + 0.5)
                                 eval_fake_b_pil.save(outf)
-                                a = net_dino.preprocess(input_img).unsqueeze(0).cuda()
-                                b = net_dino.preprocess(eval_fake_b_pil).unsqueeze(0).cuda()
+                                a = net_dino.preprocess(input_img).unsqueeze(0).to(accelerator.device)
+                                b = net_dino.preprocess(eval_fake_b_pil).unsqueeze(0).to(accelerator.device)
                                 dino_ssim = net_dino.calculate_global_ssim_loss(a, b).item()
                                 l_dino_scores_a2b.append(dino_ssim)
                         dino_score_a2b = np.mean(l_dino_scores_a2b)
                         gen_features = get_folder_features(fid_output_dir, model=feat_model, num_workers=0, num=None,
-                            shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
+                            shuffle=False, seed=0, batch_size=8, device=torch.device(accelerator.device),
                             mode="clean", custom_fn_resize=None, description="", verbose=True,
                             custom_image_tranform=None)
                         ed_mu, ed_sigma = np.mean(gen_features, axis=0), np.cov(gen_features, rowvar=False)
@@ -357,18 +395,18 @@ def main(args):
                             with torch.no_grad():
                                 input_img = T_val(Image.open(input_img_path).convert("RGB"))
                                 img_b = transforms.ToTensor()(input_img)
-                                img_b = transforms.Normalize([0.5], [0.5])(img_b).unsqueeze(0).cuda()
+                                img_b = transforms.Normalize([0.5], [0.5])(img_b).unsqueeze(0).to(accelerator.device)
                                 eval_fake_a = CycleGAN_Turbo.forward_with_networks(img_b, "b2a", eval_vae_enc, eval_unet,
                                     eval_vae_dec, noise_scheduler_1step, _timesteps, fixed_b2a_emb[0:1])
                                 eval_fake_a_pil = transforms.ToPILImage()(eval_fake_a[0] * 0.5 + 0.5)
                                 eval_fake_a_pil.save(outf)
-                                a = net_dino.preprocess(input_img).unsqueeze(0).cuda()
-                                b = net_dino.preprocess(eval_fake_a_pil).unsqueeze(0).cuda()
+                                a = net_dino.preprocess(input_img).unsqueeze(0).to(accelerator.device)
+                                b = net_dino.preprocess(eval_fake_a_pil).unsqueeze(0).to(accelerator.device)
                                 dino_ssim = net_dino.calculate_global_ssim_loss(a, b).item()
                                 l_dino_scores_b2a.append(dino_ssim)
                         dino_score_b2a = np.mean(l_dino_scores_b2a)
                         gen_features = get_folder_features(fid_output_dir, model=feat_model, num_workers=0, num=None,
-                            shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
+                            shuffle=False, seed=0, batch_size=8, device=accelerator.device,
                             mode="clean", custom_fn_resize=None, description="", verbose=True,
                             custom_image_tranform=None)
                         ed_mu, ed_sigma = np.mean(gen_features, axis=0), np.cov(gen_features, rowvar=False)
