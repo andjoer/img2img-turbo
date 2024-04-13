@@ -66,7 +66,7 @@ def main(args):
 
     if args.gan_disc_type == "vagan_clip":
         import vision_aided_loss
-        net_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="mps")
+        net_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device=accelerator.device)
     else:
         raise NotImplementedError(f"Discriminator type {args.gan_disc_type} not implemented")
 
