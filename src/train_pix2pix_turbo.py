@@ -200,16 +200,19 @@ def main(args):
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
 
+
+                """
+                Generator loss: fool the discriminator
+                """
+                x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
+
                 if "mps" in str(accelerator.device):    # size needs to be dividable by 224
                     x_tgt_resized = F.interpolate(x_tgt, size=(resize_to, resize_to), mode='bilinear')
                     x_tgt_pred_resized = F.interpolate(x_tgt, size=(resize_to, resize_to), mode='bilinear')
                 else: 
                     x_tgt_resized = x_tgt
                     x_tgt_pred_resized = x_tgt_pred
-                """
-                Generator loss: fool the discriminator
-                """
-                x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
+                    
                 lossG = net_disc(x_tgt_pred_resized, for_G=True).mean() * args.lambda_gan
 
                 accelerator.backward(lossG)
