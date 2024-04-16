@@ -50,8 +50,19 @@ def encode_prompt(prompt, tokenizers, text_encoders):
 
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
+
+
     return prompt_embeds, pooled_prompt_embeds
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 def parse_args_paired_training(input_args=None):
     """
@@ -85,6 +96,7 @@ def parse_args_paired_training(input_args=None):
 
     # details about the model architecture
     parser.add_argument("--pretrained_model_name_or_path", type=str, default= "stabilityai/stable-diffusion-xl-base-1.0")
+    parser.add_argument("--is_sdxl", type=str2bool, default= False)
     parser.add_argument("--revision", type=str, default=None,)
     parser.add_argument("--variant", type=str, default=None,)
     parser.add_argument("--tokenizer_name", type=str, default=None)
@@ -179,6 +191,7 @@ def parse_args_unpaired_training():
 
     # args for the model
     parser.add_argument("--pretrained_model_name_or_path", default="stabilityai/sd-turbo")
+    parser.add_argument("--is_sdxl", type=str2bool, default= False)
     parser.add_argument("--revision", default=None, type=str)
     parser.add_argument("--variant", default=None, type=str)
     parser.add_argument("--lora_rank_unet", default=128, type=int)
@@ -427,6 +440,7 @@ class PairedDatasetSDXL(torch.utils.data.Dataset):
 
         # input images scaled to 0,1
         img_t = self.T(input_img)
+
         img_t = F.to_tensor(img_t)
         # output images scaled to -1,1
         output_t = self.T(output_img)
@@ -434,6 +448,7 @@ class PairedDatasetSDXL(torch.utils.data.Dataset):
         output_t = F.normalize(output_t, mean=[0.5], std=[0.5])
 
         prompt_embeds, add_text_embeds = encode_prompt(caption,self.tokenizers,self.text_encoders)
+
         return {
             "output_pixel_values": output_t,
             "conditioning_pixel_values": img_t,
@@ -540,4 +555,99 @@ class UnpairedDataset(torch.utils.data.Dataset):
             "caption_tgt": self.fixed_caption_tgt,
             "input_ids_src": self.input_ids_src,
             "input_ids_tgt": self.input_ids_tgt,
+        }
+
+class UnpairedDatasetSDXL(torch.utils.data.Dataset):
+    def __init__(self, dataset_folder, split, image_prep, tokenizers,text_encoders):
+        """
+        A dataset class for loading unpaired data samples from two distinct domains (source and target),
+        typically used in unsupervised learning tasks like image-to-image translation.
+
+        The class supports loading images from specified dataset folders, applying predefined image
+        preprocessing transformations, and utilizing fixed textual prompts (captions) for each domain,
+        tokenized using a provided tokenizer.
+
+        Parameters:
+        - dataset_folder (str): Base directory of the dataset containing subdirectories (train_A, train_B, test_A, test_B)
+        - split (str): Indicates the dataset split to use. Expected values are 'train' or 'test'.
+        - image_prep (str): he image preprocessing transformation to apply to each image.
+        - tokenizer: The tokenizer used for tokenizing the captions (or prompts).
+        """
+        super().__init__()
+        if split == "train":
+            self.source_folder = os.path.join(dataset_folder, "train_A")
+            self.target_folder = os.path.join(dataset_folder, "train_B")
+        elif split == "test":
+            self.source_folder = os.path.join(dataset_folder, "test_A")
+            self.target_folder = os.path.join(dataset_folder, "test_B")
+        with open(os.path.join(dataset_folder, "fixed_prompt_a.txt"), "r") as f:
+            self.fixed_caption_src = f.read().strip()
+            self.prompt_embeds_src, self.add_text_embeds_src = encode_prompt(self.fixed_caption_src, tokenizers, text_encoders)
+
+        with open(os.path.join(dataset_folder, "fixed_prompt_b.txt"), "r") as f:
+            self.fixed_caption_tgt = f.read().strip()
+            self.prompt_embeds_tgt, self.add_text_embeds_tgt = encode_prompt(self.fixed_caption_tgt, tokenizers, text_encoders)
+        # find all images in the source and target folders with all IMG extensions
+        self.l_imgs_src = []
+        for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.gif"]:
+            self.l_imgs_src.extend(glob(os.path.join(self.source_folder, ext)))
+        self.l_imgs_tgt = []
+        for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.gif"]:
+            self.l_imgs_tgt.extend(glob(os.path.join(self.target_folder, ext)))
+        self.T = build_transform(image_prep)
+
+    def __len__(self):
+        """
+        Returns:
+        int: The total number of items in the dataset.
+        """
+        return len(self.l_imgs_src) + len(self.l_imgs_tgt)
+
+    def __getitem__(self, index):
+        """
+        Fetches a pair of unaligned images from the source and target domains along with their 
+        corresponding tokenized captions.
+
+        For the source domain, if the requested index is within the range of available images,
+        the specific image at that index is chosen. If the index exceeds the number of source
+        images, a random source image is selected. For the target domain,
+        an image is always randomly selected, irrespective of the index, to maintain the 
+        unpaired nature of the dataset.
+
+        Both images are preprocessed according to the specified image transformation `T`, and normalized.
+        The fixed captions for both domains
+        are included along with their tokenized forms.
+
+        Parameters:
+        - index (int): The index of the source image to retrieve.
+
+        Returns:
+        dict: A dictionary containing processed data for a single training example, with the following keys:
+            - "pixel_values_src": The processed source image
+            - "pixel_values_tgt": The processed target image
+            - "caption_src": The fixed caption of the source domain.
+            - "caption_tgt": The fixed caption of the target domain.
+            - "input_ids_src": The source domain's fixed caption tokenized.
+            - "input_ids_tgt": The target domain's fixed caption tokenized.
+        """
+        if index < len(self.l_imgs_src):
+            img_path_src = self.l_imgs_src[index]
+        else:
+            img_path_src = random.choice(self.l_imgs_src)
+        img_path_tgt = random.choice(self.l_imgs_tgt)
+        img_pil_src = Image.open(img_path_src).convert("RGB")
+        img_pil_tgt = Image.open(img_path_tgt).convert("RGB")
+        img_t_src = F.to_tensor(self.T(img_pil_src))
+        img_t_tgt = F.to_tensor(self.T(img_pil_tgt))
+        img_t_src = F.normalize(img_t_src, mean=[0.5], std=[0.5])
+        img_t_tgt = F.normalize(img_t_tgt, mean=[0.5], std=[0.5])
+        return {
+            "pixel_values_src": img_t_src,
+            "pixel_values_tgt": img_t_tgt,
+            "caption_src": self.fixed_caption_src,
+            "caption_tgt": self.fixed_caption_tgt,
+            "prompt_embeds_src": self.prompt_embeds_src[0,:],
+            "prompt_embeds_tgt": self.prompt_embeds_tgt[0,:],
+            "add_text_embeds_src": self.add_text_embeds_src[0,:],
+            "add_text_embeds_tgt": self.add_text_embeds_tgt[0,:]
         }

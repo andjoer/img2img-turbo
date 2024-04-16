@@ -12,6 +12,15 @@ sys.path.append(p)
 from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd, download_url
 
 
+# Copied from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl.StableDiffusionXLPipeline._get_add_time_ids
+
+def _get_add_time_ids(
+    original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None
+):
+    add_time_ids = list(tuple(original_size) + tuple(crops_coords_top_left) + tuple(target_size))
+
+    add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
+    return add_time_ids
 class VAE_encode(nn.Module):
     def __init__(self, vae, vae_b2a=None):
         super(VAE_encode, self).__init__()
@@ -45,8 +54,8 @@ class VAE_decode(nn.Module):
         return x_decoded
 
 
-def initialize_unet(rank, return_lora_module_names=False):
-    unet = UNet2DConditionModel.from_pretrained("stabilityai/sd-turbo", subfolder="unet")
+def initialize_unet(rank, model="stabilityai/sd-turbo",return_lora_module_names=False):
+    unet = UNet2DConditionModel.from_pretrained(model, subfolder="unet")
     unet.requires_grad_(False)
     unet.train()
     l_target_modules_encoder, l_target_modules_decoder, l_modules_others = [], [], []
@@ -76,18 +85,19 @@ def initialize_unet(rank, return_lora_module_names=False):
         return unet
 
 
-def initialize_vae(rank=4, return_lora_module_names=False):
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
+def initialize_vae(rank=4, device = "cuda", return_lora_module_names=False,model="stabilityai/sd-turbo"):
+    vae = AutoencoderKL.from_pretrained(model, subfolder="vae")
     vae.requires_grad_(False)
     vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
     vae.decoder.forward = my_vae_decoder_fwd.__get__(vae.decoder, vae.decoder.__class__)
     vae.requires_grad_(True)
     vae.train()
     # add the skip connection convs
-    vae.decoder.skip_conv_1 = torch.nn.Conv2d(512, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda().requires_grad_(True)
-    vae.decoder.skip_conv_2 = torch.nn.Conv2d(256, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda().requires_grad_(True)
-    vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda().requires_grad_(True)
-    vae.decoder.skip_conv_4 = torch.nn.Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda().requires_grad_(True)
+    
+    vae.decoder.skip_conv_1 = torch.nn.Conv2d(512, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device).requires_grad_(True)
+    vae.decoder.skip_conv_2 = torch.nn.Conv2d(256, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device).requires_grad_(True)
+    vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device).requires_grad_(True)
+    vae.decoder.skip_conv_4 = torch.nn.Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device).requires_grad_(True)
     torch.nn.init.constant_(vae.decoder.skip_conv_1.weight, 1e-5)
     torch.nn.init.constant_(vae.decoder.skip_conv_2.weight, 1e-5)
     torch.nn.init.constant_(vae.decoder.skip_conv_3.weight, 1e-5)
@@ -107,57 +117,57 @@ def initialize_vae(rank=4, return_lora_module_names=False):
 
 
 class CycleGAN_Turbo(torch.nn.Module):
-    def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_unet=8, lora_rank_vae=4):
+    def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_unet=8, lora_rank_vae=4,device="cuda",model="stabilityai/sd-turbo"):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").cuda()
+        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer")
+        self.text_encoder = CLIPTextModel.from_pretrained(model, subfolder="text_encoder").to(device)
         self.sched = make_1step_sched()
-        vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
-        unet = UNet2DConditionModel.from_pretrained("stabilityai/sd-turbo", subfolder="unet")
+        vae = AutoencoderKL.from_pretrained(model, subfolder="vae")
+        unet = UNet2DConditionModel.from_pretrained(model, subfolder="unet")
         vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
         vae.decoder.forward = my_vae_decoder_fwd.__get__(vae.decoder, vae.decoder.__class__)
         # add the skip connection convs
-        vae.decoder.skip_conv_1 = torch.nn.Conv2d(512, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_2 = torch.nn.Conv2d(256, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_4 = torch.nn.Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
+        vae.decoder.skip_conv_1 = torch.nn.Conv2d(512, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device)
+        vae.decoder.skip_conv_2 = torch.nn.Conv2d(256, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device)
+        vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device)
+        vae.decoder.skip_conv_4 = torch.nn.Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device)
         vae.decoder.ignore_skip = False
         self.unet, self.vae = unet, vae
         if pretrained_name == "day_to_night":
             url = "https://www.cs.cmu.edu/~img2img-turbo/models/day2night.pkl"
             self.load_ckpt_from_url(url, ckpt_folder)
-            self.timesteps = torch.tensor([999], device="cuda").long()
+            self.timesteps = torch.tensor([999], device=device).long()
             self.caption = "driving in the night"
             self.direction = "a2b"
         elif pretrained_name == "night_to_day":
             url = "https://www.cs.cmu.edu/~img2img-turbo/models/night2day.pkl"
             self.load_ckpt_from_url(url, ckpt_folder)
-            self.timesteps = torch.tensor([999], device="cuda").long()
+            self.timesteps = torch.tensor([999], device=device).long()
             self.caption = "driving in the day"
             self.direction = "b2a"
         elif pretrained_name == "clear_to_rainy":
             url = "https://www.cs.cmu.edu/~img2img-turbo/models/clear2rainy.pkl"
             self.load_ckpt_from_url(url, ckpt_folder)
-            self.timesteps = torch.tensor([999], device="cuda").long()
+            self.timesteps = torch.tensor([999], device=device).long()
             self.caption = "driving in heavy rain"
             self.direction = "a2b"
         elif pretrained_name == "rainy_to_clear":
             url = "https://www.cs.cmu.edu/~img2img-turbo/models/rainy2clear.pkl"
             self.load_ckpt_from_url(url, ckpt_folder)
-            self.timesteps = torch.tensor([999], device="cuda").long()
+            self.timesteps = torch.tensor([999], device=device).long()
             self.caption = "driving in the day"
             self.direction = "b2a"
         
         elif pretrained_path is not None:
             sd = torch.load(pretrained_path)
             self.load_ckpt_from_state_dict(sd)
-            self.timesteps = torch.tensor([999], device="cuda").long()
+            self.timesteps = torch.tensor([999], device=device).long()
             self.caption = None
             self.direction = None
 
-        self.vae_enc.cuda()
-        self.vae_dec.cuda()
-        self.unet.cuda()
+        self.vae_enc.to(device)
+        self.vae_dec.to(device)
+        self.unet.to(device)
 
     def load_ckpt_from_state_dict(self, sd):
         lora_conf_encoder = LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian", target_modules=sd["l_target_modules_encoder"], lora_alpha=sd["rank_unet"])
@@ -197,14 +207,23 @@ class CycleGAN_Turbo(torch.nn.Module):
         self.load_ckpt_from_state_dict(sd)
 
     @staticmethod
-    def forward_with_networks(x, direction, vae_enc, unet, vae_dec, sched, timesteps, text_emb):
+    def forward_with_networks(x, direction, vae_enc, unet, vae_dec, sched, timesteps, text_emb,add_text_embeds=None):
         B = x.shape[0]
         assert direction in ["a2b", "b2a"]
         x_enc = vae_enc(x, direction=direction).to(x.dtype)
-        model_pred = unet(x_enc, timesteps, encoder_hidden_states=text_emb,).sample
+
+        if add_text_embeds is None: 
+            model_pred = unet(x_enc, timesteps, encoder_hidden_states=text_emb,).sample
+        else:
+            add_time_ids = _get_add_time_ids(x.size()[-2:],[0,0],x.size()[-2:],x_enc.dtype) 
+            add_time_ids = add_time_ids.to(add_text_embeds.device).repeat(x_enc.size()[0], 1)
+            added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+            model_pred = unet(x_enc, timesteps, encoder_hidden_states=text_emb,added_cond_kwargs=added_cond_kwargs).sample
         x_out = torch.stack([sched.step(model_pred[i], timesteps[i], x_enc[i], return_dict=True).prev_sample for i in range(B)])
         x_out_decoded = vae_dec(x_out, direction=direction)
         return x_out_decoded
+
+
 
     @staticmethod
     def get_traininable_params(unet, vae_a2b, vae_b2a):

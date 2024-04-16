@@ -97,7 +97,7 @@ def main(args):
 
     if args.gan_disc_type == "vagan_clip":
         import vision_aided_loss
-        net_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="mps")
+        net_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device=accelerator.device)
     else:
         raise NotImplementedError(f"Discriminator type {args.gan_disc_type} not implemented")
 
@@ -145,32 +145,30 @@ def main(args):
             num_training_steps=args.max_train_steps * accelerator.num_processes,
             num_cycles=args.lr_num_cycles, power=args.lr_power)
 
-    if args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-xl-base-1.0":
-        revision = None
-        variant = None
-        pretrained_model_name_or_path="stabilityai/stable-diffusion-xl-base-1.0"
+
+    if args.is_sdxl:
         tokenizer_1 = AutoTokenizer.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0",
+            args.pretrained_model_name_or_path,
             subfolder="tokenizer",
-            revision=revision,
+            revision=args.revision,
             use_fast=False,
         )
         tokenizer_2 = AutoTokenizer.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0",
+            args.pretrained_model_name_or_path,
             subfolder="tokenizer_2",
-            revision=revision,
+            revision=args.revision,
             use_fast=False,
         )
-        text_encoder_cls_1 = import_model_class_from_model_name_or_path(pretrained_model_name_or_path, revision)
+        text_encoder_cls_1 = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
         text_encoder_cls_2 = import_model_class_from_model_name_or_path(
-            pretrained_model_name_or_path, revision, subfolder="text_encoder_2"
+            args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
         )
 
         text_encoder_1 = text_encoder_cls_1.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder", revision=revision, variant=variant
+            args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
         )
         text_encoder_2 = text_encoder_cls_2.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder_2", revision=revision, variant=variant
+            args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
         )
 
         # We ALWAYS pre-compute the additional condition embeddings needed for SDXL
@@ -194,6 +192,10 @@ def main(args):
     dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
 
+    if "mps" in str(accelerator.device):    # size needs to be dividable by 224
+        resize_to_opt = [224,448,672,896,1120]
+        image_size = dataset_train[0]["conditioning_pixel_values"].size()[-1]
+        resize_to = max([num for num in resize_to_opt if num < image_size])
     # Prepare everything with our `accelerator`.
     net_pix2pix, net_disc, optimizer, optimizer_disc, dl_train, lr_scheduler, lr_scheduler_disc = accelerator.prepare(
         net_pix2pix, net_disc, optimizer, optimizer_disc, dl_train, lr_scheduler, lr_scheduler_disc
@@ -250,7 +252,7 @@ def main(args):
                 x_tgt = batch["output_pixel_values"]
                 B, C, H, W = x_src.shape
                 # forward pass
-                if args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-xl-base-1.0":
+                if args.is_sdxl:
                     x_tgt_pred = net_pix2pix(x_src, caption_enc=batch["prompt_embeds"], caption_enc_pooled=batch["add_text_embeds"], deterministic=True)
                 else:
                     x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
@@ -274,20 +276,23 @@ def main(args):
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
 
-                if "mps" in str(accelerator.device):    # size needs to be dividable by 224
-                    x_tgt_resized = F.interpolate(x_tgt, size=(448, 448), mode='bilinear')
-                    x_tgt_pred_resized = F.interpolate(x_tgt, size=(448, 448), mode='bilinear')
-                else: 
-                    x_tgt_resized = x_tgt
-                    x_tgt_pred_resized = x_tgt_pred
+                
                 """
                 Generator loss: fool the discriminator
                 """
-                if args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-xl-base-1.0":
+                if args.is_sdxl:
 
                     x_tgt_pred = net_pix2pix(x_src, caption_enc=batch["prompt_embeds"], caption_enc_pooled=batch["add_text_embeds"], deterministic=True)
                 else:
                     x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
+
+                if "mps" in str(accelerator.device):    # size needs to be dividable by 224
+                    x_tgt_resized = F.interpolate(x_tgt, size=(resize_to, resize_to), mode='bilinear')
+                    x_tgt_pred_resized = F.interpolate(x_tgt, size=(resize_to, resize_to), mode='bilinear')
+                else: 
+                    x_tgt_resized = x_tgt
+                    x_tgt_pred_resized = x_tgt_pred   
+
                 lossG = net_disc(x_tgt_pred_resized, for_G=True).mean() * args.lambda_gan
 
                 accelerator.backward(lossG)
@@ -365,7 +370,7 @@ def main(args):
                             assert B == 1, "Use batch size 1 for eval."
                             with torch.no_grad():
                                 # forward pass
-                                if args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-xl-base-1.0":
+                                if args.is_sdxl:
                                     x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, caption_enc=batch_val["prompt_embeds"].to(accelerator.device), caption_enc_pooled=batch_val["add_text_embeds"].to(accelerator.device), deterministic=True)
                                 else:
                                     x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, prompt_tokens=batch_val["input_ids"].to(accelerator.device), deterministic=True)

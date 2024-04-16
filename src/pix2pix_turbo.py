@@ -31,6 +31,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
     def __init__(self, model_name= "stabilityai/sd-turbo",pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_unet=8, lora_rank_vae=4,device="mps"):
         super().__init__()
         self.model_name = model_name
+        self.device = device
         if model_name == "stabilityai/sd-turbo":
             self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
             self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").to(device)
@@ -153,7 +154,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
             ]
             vae_lora_config = LoraConfig(r=lora_rank_vae, init_lora_weights="gaussian",
                 target_modules=target_modules_vae)
-            #vae.add_adapter(vae_lora_config, adapter_name="vae_skip")
+            vae.add_adapter(vae_lora_config, adapter_name="vae_skip")
             target_modules_unet = [
                 "to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2", "conv_shortcut", "conv_out",
                 "proj_in", "proj_out", "ff.net.2", "ff.net.0.proj"
@@ -167,7 +168,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
             self.target_modules_vae = target_modules_vae
             self.target_modules_unet = target_modules_unet
 
-        # unet.enable_xformers_memory_efficient_attention()
+        #unet.enable_xformers_memory_efficient_attention()
         unet.to(self.device)
         vae.to(self.device)
         self.unet, self.vae = unet, vae
@@ -197,19 +198,14 @@ class Pix2Pix_Turbo(torch.nn.Module):
         self.vae.decoder.skip_conv_4.requires_grad_(True)
 
 
-    def compute_time_ids(self,bs):
-        crops_coords_top_left_h = 0
-        crops_coords_top_left_w = 0 
-        resolution = 512
-        crops_coords_top_left = (crops_coords_top_left_h, crops_coords_top_left_w)
+    # Copied from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl.StableDiffusionXLPipeline._get_add_time_ids
+    def _get_add_time_ids(
+        self, original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None
+    ):
+        add_time_ids = list(tuple(original_size) + tuple(crops_coords_top_left) + tuple(target_size))
 
-        original_size = target_size = (resolution, resolution)
-
-        add_time_ids = list(original_size + crops_coords_top_left + target_size)
-
-        add_time_ids = torch.tensor([add_time_ids])
-
-        return add_time_ids.to(self.device).repeat(bs, 1)
+        add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
+        return add_time_ids
 
     
 
@@ -230,14 +226,17 @@ class Pix2Pix_Turbo(torch.nn.Module):
                 caption_enc = self.text_encoder(prompt_tokens)[0]
 
         else: 
-            add_time_ids = self.compute_time_ids(bs = caption_enc.shape[0]) 
+
+            add_time_ids = self._get_add_time_ids(c_t.size()[-2:],[0,0],c_t.size()[-2:],c_t.dtype) 
+
+            add_time_ids = add_time_ids.to(caption_enc_pooled.device).repeat(c_t.size()[0], 1)
+
             added_cond_kwargs = {"text_embeds": caption_enc_pooled, "time_ids": add_time_ids}
         
         if deterministic:
-
             encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
             
-            if caption_enc is None: 
+            if caption_enc_pooled is None: 
                 model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc).sample
             else:
                 model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc,added_cond_kwargs=added_cond_kwargs).sample
