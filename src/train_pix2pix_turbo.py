@@ -208,7 +208,7 @@ def main(args):
 
                 if "mps" in str(accelerator.device):    # size needs to be dividable by 224
                     x_tgt_resized = F.interpolate(x_tgt, size=(resize_to, resize_to), mode='bilinear')
-                    x_tgt_pred_resized = F.interpolate(x_tgt, size=(resize_to, resize_to), mode='bilinear')
+                    x_tgt_pred_resized = F.interpolate(x_tgt_pred, size=(resize_to, resize_to), mode='bilinear')
                 else: 
                     x_tgt_resized = x_tgt
                     x_tgt_pred_resized = x_tgt_pred
