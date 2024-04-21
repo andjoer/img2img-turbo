@@ -24,9 +24,7 @@ from pix2pix_turbo import Pix2Pix_Turbo
 from my_utils.training_utils import parse_args_paired_training, PairedDataset, PairedDatasetSDXL
 from transformers import AutoTokenizer, PretrainedConfig
 import vision_aided_loss
-from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_instruct_pix2pix import (
-    StableDiffusionXLInstructPix2PixPipeline,
-)
+
 from diffusers.utils.torch_utils import is_compiled_module
 
 def import_model_class_from_model_name_or_path(
@@ -79,8 +77,54 @@ def main(args):
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
 
+    if args.is_sdxl:
+        tokenizer_1 = AutoTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="tokenizer",
+            revision=args.revision,
+            use_fast=False,
+        )
+        tokenizer_2 = AutoTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="tokenizer_2",
+            revision=args.revision,
+            use_fast=False,
+        )
+        text_encoder_cls_1 = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
+        text_encoder_cls_2 = import_model_class_from_model_name_or_path(
+            args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
+        )
 
-    net_pix2pix = Pix2Pix_Turbo(model_name = args.pretrained_model_name_or_path,lora_rank_unet=args.lora_rank_unet, lora_rank_vae=args.lora_rank_vae,device=accelerator.device)
+        text_encoder_1 = text_encoder_cls_1.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+        )
+        text_encoder_2 = text_encoder_cls_2.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
+        )
+
+        # We ALWAYS pre-compute the additional condition embeddings needed for SDXL
+        # UNet as the model is already big and it uses two text encoders.
+        text_encoder_1.to(accelerator.device)
+        text_encoder_2.to(accelerator.device)
+        tokenizers = [tokenizer_1, tokenizer_2]
+        text_encoders = [text_encoder_1, text_encoder_2]
+
+        # Freeze vae and text_encoders
+        text_encoder_1.requires_grad_(False)
+        text_encoder_2.requires_grad_(False)
+        dataset_train = PairedDatasetSDXL(dataset_folder=args.dataset_folder, image_prep=args.train_image_prep, split="train", tokenizers=tokenizers,text_encoders=text_encoders)
+        dataset_val = PairedDatasetSDXL(dataset_folder=args.dataset_folder, image_prep=args.test_image_prep, split="test", tokenizers=tokenizers,text_encoders=text_encoders)
+        
+
+    else: 
+        dataset_val = PairedDataset(dataset_folder=args.dataset_folder, image_prep=args.test_image_prep, split="test", tokenizer=net_pix2pix.tokenizer)
+        dataset_train = PairedDataset(dataset_folder=args.dataset_folder, image_prep=args.train_image_prep, split="train", tokenizer=net_pix2pix.tokenizer)
+
+    dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
+    dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
+
+    net_pix2pix = Pix2Pix_Turbo(model_name = args.pretrained_model_name_or_path,lora_rank_unet=args.lora_rank_unet, lora_rank_vae=args.lora_rank_vae,
+        device=accelerator.device,tokenizers=tokenizers,text_encoders=text_encoders)
     net_pix2pix.set_train()
 
     if args.enable_xformers_memory_efficient_attention and "mps" not in str(accelerator.device):
@@ -146,51 +190,6 @@ def main(args):
             num_cycles=args.lr_num_cycles, power=args.lr_power)
 
 
-    if args.is_sdxl:
-        tokenizer_1 = AutoTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="tokenizer",
-            revision=args.revision,
-            use_fast=False,
-        )
-        tokenizer_2 = AutoTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="tokenizer_2",
-            revision=args.revision,
-            use_fast=False,
-        )
-        text_encoder_cls_1 = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
-        text_encoder_cls_2 = import_model_class_from_model_name_or_path(
-            args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
-        )
-
-        text_encoder_1 = text_encoder_cls_1.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-        )
-        text_encoder_2 = text_encoder_cls_2.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
-        )
-
-        # We ALWAYS pre-compute the additional condition embeddings needed for SDXL
-        # UNet as the model is already big and it uses two text encoders.
-        text_encoder_1.to(accelerator.device)
-        text_encoder_2.to(accelerator.device)
-        tokenizers = [tokenizer_1, tokenizer_2]
-        text_encoders = [text_encoder_1, text_encoder_2]
-
-        # Freeze vae and text_encoders
-        text_encoder_1.requires_grad_(False)
-        text_encoder_2.requires_grad_(False)
-        dataset_train = PairedDatasetSDXL(dataset_folder=args.dataset_folder, image_prep=args.train_image_prep, split="train", tokenizers=tokenizers,text_encoders=text_encoders)
-        dataset_val = PairedDatasetSDXL(dataset_folder=args.dataset_folder, image_prep=args.test_image_prep, split="test", tokenizers=tokenizers,text_encoders=text_encoders)
-        
-
-    else: 
-        dataset_val = PairedDataset(dataset_folder=args.dataset_folder, image_prep=args.test_image_prep, split="test", tokenizer=net_pix2pix.tokenizer)
-        dataset_train = PairedDataset(dataset_folder=args.dataset_folder, image_prep=args.train_image_prep, split="train", tokenizer=net_pix2pix.tokenizer)
-
-    dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
-    dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
 
     if "mps" in str(accelerator.device):    # size needs to be dividable by 224
         resize_to_opt = [224,448,672,896,1120]
@@ -253,7 +252,7 @@ def main(args):
                 B, C, H, W = x_src.shape
                 # forward pass
                 if args.is_sdxl:
-                    x_tgt_pred = net_pix2pix(x_src, caption_enc=batch["prompt_embeds"], caption_enc_pooled=batch["add_text_embeds"], deterministic=True)
+                    x_tgt_pred = net_pix2pix(x_src, prompt = batch["caption"], deterministic=True,tokenizers=tokenizers,text_encoders=text_encoders)
                 else:
                     x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
                 # Reconstruction loss
@@ -282,13 +281,13 @@ def main(args):
                 """
                 if args.is_sdxl:
 
-                    x_tgt_pred = net_pix2pix(x_src, caption_enc=batch["prompt_embeds"], caption_enc_pooled=batch["add_text_embeds"], deterministic=True)
+                    x_tgt_pred = net_pix2pix(x_src, prompt = batch["caption"], deterministic=True,tokenizers=tokenizers,text_encoders=text_encoders)
                 else:
                     x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
 
                 if "mps" in str(accelerator.device):    # size needs to be dividable by 224
                     x_tgt_resized = F.interpolate(x_tgt, size=(resize_to, resize_to), mode='bilinear')
-                    x_tgt_pred_resized = F.interpolate(x_tgt, size=(resize_to, resize_to), mode='bilinear')
+                    x_tgt_pred_resized = F.interpolate(x_tgt_pred, size=(resize_to, resize_to), mode='bilinear')
                 else: 
                     x_tgt_resized = x_tgt
                     x_tgt_pred_resized = x_tgt_pred   
@@ -371,7 +370,7 @@ def main(args):
                             with torch.no_grad():
                                 # forward pass
                                 if args.is_sdxl:
-                                    x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, caption_enc=batch_val["prompt_embeds"].to(accelerator.device), caption_enc_pooled=batch_val["add_text_embeds"].to(accelerator.device), deterministic=True)
+                                    x_tgt_pred = net_pix2pix(x_src, prompt = batch_val["caption"], deterministic=True,tokenizers=tokenizers,text_encoders=text_encoders)
                                 else:
                                     x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, prompt_tokens=batch_val["input_ids"].to(accelerator.device), deterministic=True)
 

@@ -267,6 +267,12 @@ def build_transform(image_prep):
         T = transforms.Compose([
             transforms.Resize((512, 512), interpolation=Image.LANCZOS)
         ])
+
+    elif image_prep in ["resize_448", "resize_448x448"]:
+        T = transforms.Compose([
+            transforms.Resize((448, 448), interpolation=Image.LANCZOS)
+        ])
+
     elif image_prep == "no_resize":
         T = transforms.Lambda(lambda x: x)
     return T
@@ -366,7 +372,7 @@ class PairedDataset(torch.utils.data.Dataset):
         }
 
 class PairedDatasetSDXL(torch.utils.data.Dataset):
-    def __init__(self, dataset_folder, split, image_prep, text_encoders, tokenizers):
+    def __init__(self, dataset_folder, split, image_prep, text_encoders, tokenizers, embed_at_load=False):
         """
         Itialize the paired dataset object for loading and transforming paired data samples
         from specified dataset folders.
@@ -384,6 +390,7 @@ class PairedDatasetSDXL(torch.utils.data.Dataset):
         - tokenizer: The tokenizer used for tokenizing the captions (or prompts).
         """
         super().__init__()
+        self.embed_at_load = embed_at_load
         if split == "train":
             self.input_folder = os.path.join(dataset_folder, "train_A")
             self.output_folder = os.path.join(dataset_folder, "train_B")
@@ -447,16 +454,22 @@ class PairedDatasetSDXL(torch.utils.data.Dataset):
         output_t = F.to_tensor(output_t)
         output_t = F.normalize(output_t, mean=[0.5], std=[0.5])
 
-        prompt_embeds, add_text_embeds = encode_prompt(caption,self.tokenizers,self.text_encoders)
+        if self.embed_at_load:
+            prompt_embeds, add_text_embeds = encode_prompt(caption,self.tokenizers,self.text_encoders)
 
-        return {
-            "output_pixel_values": output_t,
-            "conditioning_pixel_values": img_t,
-            "caption": caption,
-            "prompt_embeds": prompt_embeds[0,:],
-            "add_text_embeds": add_text_embeds[0,:]
-        }
-
+            return {
+                "output_pixel_values": output_t,
+                "conditioning_pixel_values": img_t,
+                "caption": caption,
+                "prompt_embeds": prompt_embeds[0,:],
+                "add_text_embeds": add_text_embeds[0,:]
+            }
+        else:
+            return {
+                "output_pixel_values": output_t,
+                "conditioning_pixel_values": img_t,
+                "caption": caption,
+            }
 class UnpairedDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_folder, split, image_prep, tokenizer):
         """

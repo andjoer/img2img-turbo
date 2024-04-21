@@ -13,6 +13,8 @@ p = "src/"
 sys.path.append(p)
 from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd
 
+from my_utils.training_utils import encode_prompt
+from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline
 
 class TwinConv(torch.nn.Module):
     def __init__(self, convin_pretrained, convin_curr):
@@ -26,9 +28,32 @@ class TwinConv(torch.nn.Module):
         x2 = self.conv_in_curr(x)
         return x1 * (1 - self.r) + x2 * (self.r)
 
+    # Adapted from pipelines.StableDiffusionXLPipeline.encode_prompt
+def encode_prompts(prompts, tokenizers, text_encoders):
+    prompt_embeds_all = []
+    pooled_prompt_embeds_all = []
+
+    for prompt in prompts:
+        prompt_embeds, pooled_prompt_embeds = encode_prompt(prompt,tokenizers,text_encoders)
+        prompt_embeds_all.append(prompt_embeds[0,:])
+        pooled_prompt_embeds_all.append(pooled_prompt_embeds[0,:])
+
+    return torch.stack(prompt_embeds_all), torch.stack(pooled_prompt_embeds_all)
+# Adapted from examples.dreambooth.train_dreambooth_lora_sdxl
+# Here, we compute not just the text embeddings but also the additional embeddings
+# needed for the SD XL UNet to operate.
+def compute_embeddings_for_prompts(prompts, tokenizers, text_encoders,device="cuda"):
+    with torch.no_grad():
+        prompt_embeds_all, pooled_prompt_embeds_all = encode_prompts(prompts, tokenizers,text_encoders)
+        add_text_embeds_all = pooled_prompt_embeds_all
+
+        prompt_embeds_all = prompt_embeds_all.to(device)
+        add_text_embeds_all = add_text_embeds_all.to(device)
+    return prompt_embeds_all, add_text_embeds_all
 
 class Pix2Pix_Turbo(torch.nn.Module):
-    def __init__(self, model_name= "stabilityai/sd-turbo",pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_unet=8, lora_rank_vae=4,device="mps"):
+    def __init__(self, model_name= "stabilityai/sd-turbo",pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_unet=8, lora_rank_vae=4,device="cuda",
+    tokenizers=None, text_encoders=None):
         super().__init__()
         self.model_name = model_name
         self.device = device
@@ -38,7 +63,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
             self.sched = make_1step_sched(model_name, device)
             self.device = device
             vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
-        elif model_name == "stabilityai/stable-diffusion-xl-base-1.0":
+        elif model_name == "stabilityai/stable-diffusion-xl-base-1.0" or "Fill50k_sdxl_2":
             print('###using stable diffusion xl')
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, subfolder="tokenizer")
             self.text_encoder = CLIPTextModel.from_pretrained(model_name, subfolder="text_encoder").to(device)
@@ -207,13 +232,14 @@ class Pix2Pix_Turbo(torch.nn.Module):
         add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
         return add_time_ids
 
-    
 
-    def forward(self, c_t, prompt=None, prompt_tokens=None, caption_enc=None, caption_enc_pooled=None, deterministic=True, r=1.0, noise_map=None):
+
+    def forward(self, c_t, prompt=None, prompt_tokens=None, caption_enc=None, caption_enc_pooled=None, deterministic=True, r=1.0, noise_map=None,tokenizers=None,text_encoders=None,negative_prompt=None, guidance_scale=0):
         # either the prompt or the prompt_tokens should be provided
         #assert ((prompt is None) != (prompt_tokens is None)), "Either prompt or prompt_tokens should be provided"
 
-        if caption_enc is None:
+        #negative_prompt = "unsharp"
+        if tokenizers is None:
             if prompt is not None:
                 # encode the text prompt
                 caption_tokens = self.tokenizer(prompt, max_length=self.tokenizer.model_max_length,
@@ -226,20 +252,41 @@ class Pix2Pix_Turbo(torch.nn.Module):
                 caption_enc = self.text_encoder(prompt_tokens)[0]
 
         else: 
+            
+            caption_enc, caption_enc_pooled = compute_embeddings_for_prompts(prompt, tokenizers, text_encoders,device=self.device)
 
             add_time_ids = self._get_add_time_ids(c_t.size()[-2:],[0,0],c_t.size()[-2:],c_t.dtype) 
 
             add_time_ids = add_time_ids.to(caption_enc_pooled.device).repeat(c_t.size()[0], 1)
 
+            if negative_prompt is not None:
+                negative_prompt_embeds, negative_pooled_prompt_embeds = compute_embeddings_for_prompts(['unsharp']*len(prompt), tokenizers, text_encoders,device=self.device)
+                caption_enc = torch.cat([negative_prompt_embeds, caption_enc], dim=0)
+                caption_enc_pooled = torch.cat([negative_pooled_prompt_embeds, caption_enc_pooled ], dim=0)
+                add_time_ids = torch.cat([add_time_ids, add_time_ids], dim=0)
+
+            
             added_cond_kwargs = {"text_embeds": caption_enc_pooled, "time_ids": add_time_ids}
         
         if deterministic:
+
             encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
-            
-            if caption_enc_pooled is None: 
+
+            if negative_prompt is not None: 
+                encoded_control_conc = torch.cat([encoded_control] * 2)
+
+            else:
+                encoded_control_conc = encoded_control
+            if tokenizers is None: 
                 model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc).sample
             else:
-                model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc,added_cond_kwargs=added_cond_kwargs).sample
+                noise_pred = self.unet(encoded_control_conc, self.timesteps, encoder_hidden_states=caption_enc,added_cond_kwargs=added_cond_kwargs).sample
+                if negative_prompt is not None: 
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    model_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                else:
+                    model_pred = noise_pred
+            
             x_denoised = self.sched.step(model_pred, self.timesteps, encoded_control, return_dict=True).prev_sample
             self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
             output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
