@@ -10,6 +10,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+data/
 build/
 develop-eggs/
 dist/
@@ -169,3 +170,8 @@ outputs/bird.png
 data
 wandb
 output/
+call_pipeline
+*.pkl
+notes
+Fill50k_sdxl_2
+output

@@ -4,10 +4,10 @@ from tqdm import tqdm
 from diffusers import DDPMScheduler
 
 
-def make_1step_sched():
-    noise_scheduler_1step = DDPMScheduler.from_pretrained("stabilityai/sd-turbo", subfolder="scheduler")
-    noise_scheduler_1step.set_timesteps(1, device="cuda")
-    noise_scheduler_1step.alphas_cumprod = noise_scheduler_1step.alphas_cumprod.cuda()
+def make_1step_sched(model, device):
+    noise_scheduler_1step = DDPMScheduler.from_pretrained(model, subfolder="scheduler")
+    noise_scheduler_1step.set_timesteps(1, device=device)
+    noise_scheduler_1step.alphas_cumprod = noise_scheduler_1step.alphas_cumprod.to(device)
     return noise_scheduler_1step
 
 
