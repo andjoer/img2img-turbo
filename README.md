@@ -1,3 +1,10 @@
+# img2img-turbo for Stable Diffusion XL and Apple Silicon
+
+I created two new branches (the original one is untouched, so please select the new branches):
+
+1) apple silicon: I changed the training scripts to work on apple silicon
+2) stable-diffusion-xl: I changed the training scripts to work on apple silicon and support sdxl
+
 # img2img-turbo
 
 [**Paper**](https://arxiv.org/abs/2403.12036) | [**Sketch2Image Demo**](https://huggingface.co/spaces/gparmar/img2img-turbo-sketch)
