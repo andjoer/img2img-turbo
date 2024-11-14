@@ -110,7 +110,7 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--resolution", type=int, default=512,)
     parser.add_argument("--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader.")
     parser.add_argument("--num_training_epochs", type=int, default=10)
-    parser.add_argument("--max_train_steps", type=int, default=10_000,)
+    parser.add_argument("--max_train_steps", type=int, default=50_000,)
     parser.add_argument("--checkpointing_steps", type=int, default=500,)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.",)
     parser.add_argument("--gradient_checkpointing", action="store_true",)

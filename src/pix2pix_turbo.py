@@ -15,6 +15,27 @@ from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd
 
 from my_utils.training_utils import encode_prompt
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline
+from transformers import AutoTokenizer, PretrainedConfig
+
+def import_model_class_from_model_name_or_path(
+    pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
+):
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path, subfolder=subfolder, revision=revision
+    )
+    model_class = text_encoder_config.architectures[0]
+
+    if model_class == "CLIPTextModel":
+        from transformers import CLIPTextModel
+
+        return CLIPTextModel
+    elif model_class == "CLIPTextModelWithProjection":
+        from transformers import CLIPTextModelWithProjection
+
+        return CLIPTextModelWithProjection
+    else:
+        raise ValueError(f"{model_class} is not supported.")
+    
 
 class TwinConv(torch.nn.Module):
     def __init__(self, convin_pretrained, convin_curr):
@@ -52,27 +73,56 @@ def compute_embeddings_for_prompts(prompts, tokenizers, text_encoders,device="cu
     return prompt_embeds_all, add_text_embeds_all
 
 class Pix2Pix_Turbo(torch.nn.Module):
-    def __init__(self, model_name= "stabilityai/sd-turbo",pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_unet=8, lora_rank_vae=4,device="cuda",
-    tokenizers=None, text_encoders=None):
+    def __init__(self, model_name= "stabilityai/sd-turbo",pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", is_sdxl = False,lora_rank_unet=8, lora_rank_vae=4,device="cuda"):
         super().__init__()
+        self.is_sdxl = is_sdxl
         self.model_name = model_name
         self.device = device
-        if model_name == "stabilityai/sd-turbo":
+        if not is_sdxl:
             self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
             self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").to(device)
             self.sched = make_1step_sched(model_name, device)
             self.device = device
             vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
-        elif model_name == "stabilityai/stable-diffusion-xl-base-1.0" or "Fill50k_sdxl_2":
+        else:
             print('###using stable diffusion xl')
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, subfolder="tokenizer")
+            tokenizer_1 = AutoTokenizer.from_pretrained(
+            model_name,
+            subfolder="tokenizer",
+            use_fast=False,
+            )
+            tokenizer_2 = AutoTokenizer.from_pretrained(
+                model_name,
+                subfolder="tokenizer_2",
+                use_fast=False,
+            )
+            text_encoder_cls_1 = import_model_class_from_model_name_or_path(model_name,revision=None)
+            text_encoder_cls_2 = import_model_class_from_model_name_or_path(
+                model_name,  subfolder="text_encoder_2",revision=None
+            )
+
+            text_encoder_1 = text_encoder_cls_1.from_pretrained(
+                model_name, subfolder="text_encoder"
+            )
+            text_encoder_2 = text_encoder_cls_2.from_pretrained(
+                model_name, subfolder="text_encoder_2"
+            )
+
+            # We ALWAYS pre-compute the additional condition embeddings needed for SDXL
+            # UNet as the model is already big and it uses two text encoders.
+            text_encoder_1.to(device)
+            text_encoder_2.to(device)
+            self.tokenizers = [tokenizer_1, tokenizer_2]
+            self.text_encoders = [text_encoder_1, text_encoder_2]
+
+            # Freeze vae and text_encoders
+            text_encoder_1.requires_grad_(False)
+            text_encoder_2.requires_grad_(False)
             self.text_encoder = CLIPTextModel.from_pretrained(model_name, subfolder="text_encoder").to(device)
             self.sched = make_1step_sched(model_name, device)
             self.device = device
             vae = AutoencoderKL.from_pretrained(model_name, subfolder="vae")
 
-        else:
-            raise NotImplementedError(f"Model {self.model_name} not implemented")
         vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
         vae.decoder.forward = my_vae_decoder_fwd.__get__(vae.decoder, vae.decoder.__class__)
         #add the skip connection convs
@@ -81,6 +131,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
         vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device)
         vae.decoder.skip_conv_4 = torch.nn.Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False).to(device)
         vae.decoder.ignore_skip = False
+
         unet = UNet2DConditionModel.from_pretrained(model_name, subfolder="unet")
 
         if pretrained_name == "edge_to_image":
@@ -156,6 +207,10 @@ class Pix2Pix_Turbo(torch.nn.Module):
             sd = torch.load(pretrained_path, map_location="cpu")
             unet_lora_config = LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian", target_modules=sd["unet_lora_target_modules"])
             vae_lora_config = LoraConfig(r=sd["rank_vae"], init_lora_weights="gaussian", target_modules=sd["vae_lora_target_modules"])
+            self.lora_rank_unet = sd["rank_unet"]
+            self.lora_rank_vae = sd["rank_vae"]
+            self.target_modules_vae = sd["vae_lora_target_modules"]
+            self.target_modules_unet = sd["unet_lora_target_modules"]
             vae.add_adapter(vae_lora_config, adapter_name="vae_skip")
             _sd_vae = vae.state_dict()
             for k in sd["state_dict_vae"]:
@@ -192,6 +247,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
             self.lora_rank_vae = lora_rank_vae
             self.target_modules_vae = target_modules_vae
             self.target_modules_unet = target_modules_unet
+
 
         #unet.enable_xformers_memory_efficient_attention()
         unet.to(self.device)
@@ -239,7 +295,8 @@ class Pix2Pix_Turbo(torch.nn.Module):
         #assert ((prompt is None) != (prompt_tokens is None)), "Either prompt or prompt_tokens should be provided"
 
         #negative_prompt = "unsharp"
-        if tokenizers is None:
+
+        if not self.is_sdxl:
             if prompt is not None:
                 # encode the text prompt
                 caption_tokens = self.tokenizer(prompt, max_length=self.tokenizer.model_max_length,
@@ -252,15 +309,15 @@ class Pix2Pix_Turbo(torch.nn.Module):
                 caption_enc = self.text_encoder(prompt_tokens)[0]
 
         else: 
-            
-            caption_enc, caption_enc_pooled = compute_embeddings_for_prompts(prompt, tokenizers, text_encoders,device=self.device)
+
+            caption_enc, caption_enc_pooled = compute_embeddings_for_prompts(prompt, self.tokenizers, self.text_encoders,device=self.device)
 
             add_time_ids = self._get_add_time_ids(c_t.size()[-2:],[0,0],c_t.size()[-2:],c_t.dtype) 
 
             add_time_ids = add_time_ids.to(caption_enc_pooled.device).repeat(c_t.size()[0], 1)
 
             if negative_prompt is not None:
-                negative_prompt_embeds, negative_pooled_prompt_embeds = compute_embeddings_for_prompts(['unsharp']*len(prompt), tokenizers, text_encoders,device=self.device)
+                negative_prompt_embeds, negative_pooled_prompt_embeds = compute_embeddings_for_prompts(['unsharp']*len(prompt), self.tokenizers, self.text_encoders,device=self.device)
                 caption_enc = torch.cat([negative_prompt_embeds, caption_enc], dim=0)
                 caption_enc_pooled = torch.cat([negative_pooled_prompt_embeds, caption_enc_pooled ], dim=0)
                 add_time_ids = torch.cat([add_time_ids, add_time_ids], dim=0)
@@ -277,7 +334,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
 
             else:
                 encoded_control_conc = encoded_control
-            if tokenizers is None: 
+            if not self.is_sdxl: 
                 model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc).sample
             else:
                 noise_pred = self.unet(encoded_control_conc, self.timesteps, encoder_hidden_states=caption_enc,added_cond_kwargs=added_cond_kwargs).sample
@@ -312,6 +369,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
         sd["vae_lora_target_modules"] = self.target_modules_vae
         sd["rank_unet"] = self.lora_rank_unet
         sd["rank_vae"] = self.lora_rank_vae
-        sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
-        sd["state_dict_vae"] = {k: v for k, v in self.vae.state_dict().items() if "lora" in k or "skip" in k}
+        sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items()}#{k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
+        #print([k for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k])
+        sd["state_dict_vae"] = {k: v for k, v in self.vae.state_dict().items()}#{k: v for k, v in self.vae.state_dict().items() if "lora" in k or "skip" in k}
         torch.save(sd, outf)

@@ -77,6 +77,10 @@ def main(args):
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
 
+
+    net_pix2pix = Pix2Pix_Turbo(model_name = args.pretrained_model_name_or_path,is_sdxl=args.is_sdxl,lora_rank_unet=args.lora_rank_unet, lora_rank_vae=args.lora_rank_vae,
+        device=accelerator.device)
+    
     if args.is_sdxl:
         tokenizer_1 = AutoTokenizer.from_pretrained(
             args.pretrained_model_name_or_path,
@@ -123,8 +127,6 @@ def main(args):
     dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
 
-    net_pix2pix = Pix2Pix_Turbo(model_name = args.pretrained_model_name_or_path,lora_rank_unet=args.lora_rank_unet, lora_rank_vae=args.lora_rank_vae,
-        device=accelerator.device,tokenizers=tokenizers,text_encoders=text_encoders)
     net_pix2pix.set_train()
 
     if args.enable_xformers_memory_efficient_attention and "mps" not in str(accelerator.device):
@@ -252,7 +254,7 @@ def main(args):
                 B, C, H, W = x_src.shape
                 # forward pass
                 if args.is_sdxl:
-                    x_tgt_pred = net_pix2pix(x_src, prompt = batch["caption"], deterministic=True,tokenizers=tokenizers,text_encoders=text_encoders)
+                    x_tgt_pred = net_pix2pix(x_src, prompt = batch["caption"], deterministic=True)
                 else:
                     x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
                 # Reconstruction loss
@@ -281,7 +283,7 @@ def main(args):
                 """
                 if args.is_sdxl:
 
-                    x_tgt_pred = net_pix2pix(x_src, prompt = batch["caption"], deterministic=True,tokenizers=tokenizers,text_encoders=text_encoders)
+                    x_tgt_pred = net_pix2pix(x_src, prompt = batch["caption"], deterministic=True)
                 else:
                     x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
 
@@ -356,7 +358,8 @@ def main(args):
                         accelerator.unwrap_model(net_pix2pix).save_model(outf)
 
                     # compute validation set FID, L2, LPIPS, CLIP-SIM
-                    if global_step % args.eval_freq == 1:# and global_step > 200:
+                    if global_step % args.eval_freq == 1 and global_step > 200:
+                        print('start validation')
                         l_l2, l_lpips, l_clipsim = [], [], []
                         if args.track_val_fid:
                             os.makedirs(os.path.join(args.output_dir, "eval", f"fid_{global_step}"), exist_ok=True)
@@ -370,7 +373,7 @@ def main(args):
                             with torch.no_grad():
                                 # forward pass
                                 if args.is_sdxl:
-                                    x_tgt_pred = net_pix2pix(x_src, prompt = batch_val["caption"], deterministic=True,tokenizers=tokenizers,text_encoders=text_encoders)
+                                    x_tgt_pred = net_pix2pix(x_src, prompt = batch_val["caption"], deterministic=True)
                                 else:
                                     x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, prompt_tokens=batch_val["input_ids"].to(accelerator.device), deterministic=True)
 

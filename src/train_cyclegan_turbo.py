@@ -420,6 +420,7 @@ def main(args):
                         sd["sd_encoder"] = get_peft_model_state_dict(eval_unet, adapter_name="default_encoder")
                         sd["sd_decoder"] = get_peft_model_state_dict(eval_unet, adapter_name="default_decoder")
                         sd["sd_other"] = get_peft_model_state_dict(eval_unet, adapter_name="default_others")
+                        sd["unet"] = eval_unet.state_dict()
                         sd["rank_vae"] = args.lora_rank_vae
                         sd["vae_lora_target_modules"] = vae_lora_target_modules
                         sd["sd_vae_enc"] = eval_vae_enc.state_dict()
