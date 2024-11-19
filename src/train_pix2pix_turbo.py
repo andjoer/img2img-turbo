@@ -79,7 +79,7 @@ def main(args):
 
 
     net_pix2pix = Pix2Pix_Turbo(model_name = args.pretrained_model_name_or_path,is_sdxl=args.is_sdxl,lora_rank_unet=args.lora_rank_unet, lora_rank_vae=args.lora_rank_vae,
-        device=accelerator.device)
+        device=accelerator.device, pretrained_path=args.pretrained_path)
     
     if args.is_sdxl:
         tokenizer_1 = AutoTokenizer.from_pretrained(
