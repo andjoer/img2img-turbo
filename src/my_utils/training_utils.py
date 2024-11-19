@@ -96,6 +96,7 @@ def parse_args_paired_training(input_args=None):
 
     # details about the model architecture
     parser.add_argument("--pretrained_model_name_or_path", type=str, default= "stabilityai/stable-diffusion-xl-base-1.0")
+    parser.add_argument("--pretrained_path", type=str, default= None)
     parser.add_argument("--is_sdxl", type=str2bool, default= False)
     parser.add_argument("--revision", type=str, default=None,)
     parser.add_argument("--variant", type=str, default=None,)
@@ -346,8 +347,8 @@ class PairedDataset(torch.utils.data.Dataset):
         should be compatible with the models intended to be used with this dataset.
         """
         img_name = self.img_names[idx]
-        input_img = Image.open(os.path.join(self.input_folder, img_name))
-        output_img = Image.open(os.path.join(self.output_folder, img_name))
+        input_img = Image.open(os.path.join(self.input_folder, img_name)).convert("RGB")
+        output_img = Image.open(os.path.join(self.output_folder, img_name)).convert("RGB")
         caption = self.captions[img_name]
 
         # input images scaled to 0,1
@@ -441,8 +442,8 @@ class PairedDatasetSDXL(torch.utils.data.Dataset):
         should be compatible with the models intended to be used with this dataset.
         """
         img_name = self.img_names[idx]
-        input_img = Image.open(os.path.join(self.input_folder, img_name))
-        output_img = Image.open(os.path.join(self.output_folder, img_name))
+        input_img = Image.open(os.path.join(self.input_folder, img_name)).convert("RGB")
+        output_img = Image.open(os.path.join(self.output_folder, img_name)).convert("RGB")
         caption = self.captions[img_name]
 
         # input images scaled to 0,1
