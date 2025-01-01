@@ -100,7 +100,7 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--tracker_project_name", type=str, default="train_pix2pix_turbo", help="The name of the wandb project to log to.")
 
     # details about the model architecture
-    parser.add_argument("--pretrained_model_name_or_path", type=str, default= "stabilityai/stable-diffusion-xl-base-1.0")
+    parser.add_argument("--pretrained_model_name_or_path", type=str, default= "stabilityai/sd-turbo")
     parser.add_argument("--pretrained_path", type=str, default= None)
     parser.add_argument("--out_model_name", type=str, default= "test_model")
     parser.add_argument("--model_type", type=str, default= "sd")
