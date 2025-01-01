@@ -7,15 +7,8 @@ pillow>=9.5.0
 scipy==1.11.1
 timm>=0.9.2
 tokenizers
-torch>=2.0.1
-
-torchaudio>=2.0.2
-torchdata==0.6.1
-torchmetrics>=1.0.1
-torchvision>=0.15.2
-
 tqdm>=4.65.0
-transformers==4.35.2
+transformers
 triton==2.0.0
 urllib3<1.27,>=1.25.4
 xformers>=0.0.20
@@ -24,5 +17,10 @@ lpips
 clean-fid
 peft
 dominate
-diffusers==0.25.1
+diffusers @ git+https://github.com/huggingface/diffusers
 gradio==3.43.1
+accelerate
+sentencepiece
+vision-aided-loss
+wandb
+
