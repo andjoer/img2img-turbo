@@ -1,7 +1,7 @@
 # Pix2Pix Turbo: Diffusion-Based Image-to-Image and CycleGAN-Style Training
 
 Forked from GaParmar/img2img-turbo. The structure has been refactored so that the pix2pix as well as the cyclegan training and inference scripts are relying on the same pix2pix-turbo model. 
-Features have been added to explore different model configurations and to support newer models including Flow-Matching ones. 
+Features have been added to explore different model configurations and to support newer models including Flow-Matching ones and it is possible to run on apple MPS. 
 
 This repository provides code to train diffusion-based image-to-image models using Stable Diffusion, Stable Diffusion XL (SDXL), or Stable Diffusion 3 (SD3) in a GAN setup. It includes:
 - A **pix2pix**-style approach for paired datasets (`train_pix2pix_turbo.py`).
@@ -9,6 +9,11 @@ This repository provides code to train diffusion-based image-to-image models usi
 
 Both rely on the core model logic provided in `pix2pix_turbo.py` and several helper utilities in `training_utils.py`.  
 Below is an overview of each file, their functions, and the command-line parameters that configure the training process.
+
+---
+
+## Project status
+There are still left-overs from the original code that are not needed anymore. Some refactor still needs to be done. It is possible to train on MPS, but the GAN works different, which is why the cyclegan does not converge. The problem is the discriminator. If the discriminator runs on CPU and the rest on MPS the training metrics are very similar to cuda. I'm currently testing if I can make the discriminator run on MPS, otherwise I will publish a version with the option to put the discriminator on CPU. 
 
 ---
 
@@ -96,7 +101,7 @@ python train_pix2pix_turbo.py \
 
 ### Command-Line Parameters
 
-Below is a summary of **paired**-training arguments from `parse_args_paired_training()` (found in `training_utils.py`):
+Below is a summary of **paired**-training arguments from `parse_args_paired_training()`:
 
 | Argument                                 | Type    | Default | Description                                                                                                                                                                                                                                                                                                                                       |
 |------------------------------------------|---------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
