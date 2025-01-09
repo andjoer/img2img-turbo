@@ -246,7 +246,7 @@ def main(args):
                 # B -> fake A -> rec B
 
                 cyc_fake_a = cyclegan_turbo.forward_cycle(img_b,"b2a",timesteps, fixed_b2a_emb)
-                cyc_rec_b = cyclegan_turbo.forward_cycle(cyc_fake_a, "b2a",timesteps, fixed_b2a_emb)
+                cyc_rec_b = cyclegan_turbo.forward_cycle(cyc_fake_a, "a2b",timesteps, fixed_b2a_emb)
 
                 loss_cycle_b = crit_cycle(cyc_rec_b, img_b) * args.lambda_cycle
                 loss_cycle_b += net_lpips(cyc_rec_b, img_b).mean() * args.lambda_cycle_lpips
