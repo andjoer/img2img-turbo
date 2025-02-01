@@ -13,7 +13,7 @@ Below is an overview of each file, their functions, and the command-line paramet
 ---
 
 ## Project status
-There are still left-overs from the original code that are not needed anymore. Some refactor still needs to be done. It is possible to train on MPS, but the GAN works different, which is why the cyclegan does not converge. The problem is the discriminator. If the discriminator runs on CPU and the rest on MPS the training metrics are very similar to cuda. I'm currently testing if I can make the discriminator run on MPS, otherwise I will publish a version with the option to put the discriminator on CPU. 
+There are still left-overs from the original code that are not needed anymore. Some refactor still needs to be done. It is possible to train on MPS, but the GAN works different, which is why the cyclegan does not converge. The problem is the discriminator. If the first conv layer of the discriminator is put on cpu it works, which is done now by the function "prepare_disc"
 
 ---
 
@@ -41,6 +41,7 @@ This file defines the main `Pix2Pix_Turbo` class, which wraps a diffusion model 
   - Regular stable diffusion (v1.x or v2.x), 
   - Stable Diffusion XL (SDXL),
   - Stable Diffusion 3 (SD3).
+  - Flux (it trains but has bad training behaviour, it is not fully tested)
 - **LoRA** (Low-Rank Adaptation) integration for training certain layers in UNet and VAE.
 - **Skip connections** injection into the VAE for flexible architecture (useful in certain advanced setups).
 - **Prompt encoding** logic for SD, SDXL, and SD3.

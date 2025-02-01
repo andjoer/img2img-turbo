@@ -5,12 +5,20 @@ import copy
 from tqdm import tqdm
 import torch
 from typing import Any, Callable, Dict, List, Optional, Union
-from transformers import AutoTokenizer, CLIPTextModel, PretrainedConfig
+import traceback
+from transformers import (
+    AutoTokenizer,
+    CLIPTextModel,
+    PretrainedConfig,
+    T5EncoderModel,
+    CLIPTokenizer,
+    T5TokenizerFast,
+)
 from diffusers import AutoencoderKL, SD3Transformer2DModel
 from diffusers import UNet2DConditionModel
-from diffusers.utils.peft_utils import (
-    set_weights_and_activate_adapters,
-)
+from diffusers.loaders.lora_pipeline import SD3LoraLoaderMixin
+from diffusers.loaders.single_file import FromSingleFileMixin
+from diffusers.utils.peft_utils import set_weights_and_activate_adapters
 from diffusers.utils import (
     USE_PEFT_BACKEND,
     is_torch_xla_available,
@@ -20,15 +28,24 @@ from diffusers.utils import (
     unscale_lora_layers,
 )
 from peft import LoraConfig
-
-p = "src/"
-sys.path.append(p)
-from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd
-from my_utils.training_utils import encode_prompt
-from diffusers.loaders.lora_pipeline import SD3LoraLoaderMixin
-from diffusers.loaders.single_file import FromSingleFileMixin
-from diffusers.utils.torch_utils import is_compiled_module
 import torch.nn as nn
+from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd
+
+from transformers.pytorch_utils import Conv1D
+
+def get_specific_layer_names(model):
+    # Create a list to store the layer names
+    layer_names = []
+    
+    # Recursively visit all modules and submodules
+    for name, module in model.named_modules():
+        # Check if the module is an instance of the specified layers
+        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding, torch.nn.Conv2d, Conv1D)):
+            # model name parsing 
+
+            layer_names.append('.'.join(name.split('.')[4:]).split('.')[0])
+    
+    return layer_names
 
 
 def import_model_class_from_model_name_or_path(
@@ -190,6 +207,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
         original_vae=False,
         original_unet=False,
         model_type=None,
+        accelerator=None,
     ):
         super().__init__()
         self.unpaired = unpaired
@@ -273,17 +291,48 @@ class Pix2Pix_Turbo(torch.nn.Module):
             self.text_encoders = [self.text_encoder_1, self.text_encoder_2, self.text_encoder_3]
             self.tokenizer_max_length = 77
             self.prompt_encoder = self.encode_prompt_sd3  # <--- function for SD3
+
+        elif model_type == "flux":
+            from diffusers import FluxTransformer2DModel
+
+            # 1) Load tokenizers:
+            self.tokenizer = CLIPTokenizer.from_pretrained(model_name, subfolder="tokenizer")
+            self.tokenizer_2   = T5TokenizerFast.from_pretrained(model_name, subfolder="tokenizer_2")
+
+            # 2) Load text encoders:
+            self.text_encoder = CLIPTextModel.from_pretrained(model_name, subfolder="text_encoder").to(device)
+            self.text_encoder_2   = T5EncoderModel.from_pretrained(model_name, subfolder="text_encoder_2").to(device)
+            self.text_encoder.requires_grad_(False)
+            self.text_encoder_2.requires_grad_(False)
+
+            self.tokenizer_max_length = (
+                    self.tokenizer.model_max_length if hasattr(self, "tokenizer") and self.tokenizer is not None else 77
+                )
+            self.device = device
+            self.timesteps = torch.tensor([1000], device=self.device).float()
+
+            self.prompt_encoder = self.encode_prompt_flux # <--- function for FLUX
+
         # ------------------------------------------------------------------
         # END SETUP
         # ------------------------------------------------------------------
 
         for i in range(2):
-            if model_type != "sd3":
-                unet = UNet2DConditionModel.from_pretrained(model_name, subfolder="unet")
-            else:
-                unet = SD3Transformer2DModel.from_pretrained(model_name, subfolder="transformer")
-
             vae = AutoencoderKL.from_pretrained(model_name, subfolder="vae")
+            if model_type not in  ["sd3","flux"]:
+                unet = UNet2DConditionModel.from_pretrained(model_name, subfolder="unet")
+            elif model_type == "sd3":
+                unet = SD3Transformer2DModel.from_pretrained(model_name, subfolder="transformer")
+            elif model_type == "flux":
+
+                unet = FluxTransformer2DModel.from_pretrained(model_name, subfolder="transformer")
+                self.vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+
+                self.vae_shift_factor = getattr(vae.config, "shift_factor", 0.0)
+                self.vae_scaling_factor = getattr(vae.config, "scaling_factor", 1.0)
+
+            unet.requires_grad_(False)
+            vae.requires_grad_(False)
 
             if i == 1 and num_inputs == 3:
                 unet = add_channels(unet)
@@ -306,23 +355,53 @@ class Pix2Pix_Turbo(torch.nn.Module):
                     "to_out.0",
                 ]
 
-                target_modules_unet = [
-                    "to_k",
-                    "to_q",
-                    "to_v",
-                    "to_out.0",
-                    "conv",
-                    "conv1",
-                    "conv2",
-                    "conv_shortcut",
-                    "conv_out",
-                    "proj_in",
-                    "proj_out",
-                    "ff.net.2",
-                    "ff.net.0.proj",
-                ]
+                if model_type == "flux":
+                    target_modules_unet = [
+                        "attn.to_k",
+                        "attn.to_q",
+                        "attn.to_v",
+                        "attn.to_out.0",
+                        "attn.add_k_proj",
+                        "attn.add_q_proj",
+                        "attn.add_v_proj",
+                        "attn.to_add_out",
+                        "ff.net.0.proj",
+                        "ff.net.2",
+                        "ff_context.net.0.proj",
+                        "ff_context.net.2",
+                    ]
+                    #target_modules_unet = list(set(get_specific_layer_names(unet)))
+                    #print(f"lora target modules: {target_modules_unet}")
 
-                if self.unpaired and not model_type == "sd3":
+                elif model_type == "sd3":
+                    target_modules_unet = [
+                        "attn.add_k_proj",
+                        "attn.add_q_proj",
+                        "attn.add_v_proj",
+                        "attn.to_add_out",
+                        "attn.to_k",
+                        "attn.to_out.0",
+                        "attn.to_q",
+                        "attn.to_v",
+                    ]
+                else:
+                    target_modules_unet = [
+                        "to_k",
+                        "to_q",
+                        "to_v",
+                        "to_out.0",
+                        "conv",
+                        "conv1",
+                        "conv2",
+                        "conv_shortcut",
+                        "conv_out",
+                        "proj_in",
+                        "proj_out",
+                        "ff.net.2",
+                        "ff.net.0.proj",
+                    ]
+
+                if self.unpaired and not model_type in ["sd3","flux"]:
                     target_modules_unet.append("conv_in")
 
                 self.unet_has_adapter = False
@@ -353,7 +432,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
                                 vae.decoder.ignore_skip = False
                                 self.has_skips = True
                                 break
-
+                            
                     if sd["unet_lora_target_modules"] and not original_unet:
                         unet_lora_config = LoraConfig(
                             r=sd["rank_unet"],
@@ -362,6 +441,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
                         )
                         unet.add_adapter(unet_lora_config)
                         self.unet_has_adapter = True
+
                     if sd["vae_lora_target_modules"] and not original_vae:
                         vae_lora_config = LoraConfig(
                             r=sd["rank_vae"],
@@ -395,9 +475,12 @@ class Pix2Pix_Turbo(torch.nn.Module):
 
                         if num_inputs == 3 and i == 0:
                             unet = add_channels(unet)  # pretrained model (lora) has only 4 channels
-                        break
+                break
 
-            except:
+            except Exception as e:
+                # Print the full traceback
+                print("An error occurred:")
+                traceback.print_exc()
                 print("pretrained model has additional channels, repeat loading")
 
         # If we haven't found skip connections from the loaded model and 
@@ -435,11 +518,13 @@ class Pix2Pix_Turbo(torch.nn.Module):
         elif not self.vae_has_adapter:
             target_modules_vae = []
 
+
         if lora_rank_unet > 0 and not self.freeze_unet and not self.unet_has_adapter:
-            unet_lora_config = LoraConfig(r=lora_rank_unet, init_lora_weights="gaussian", target_modules=target_modules_unet)
+            unet_lora_config = LoraConfig(r=lora_rank_unet, lora_alpha = lora_rank_unet, init_lora_weights="gaussian", target_modules=target_modules_unet)
             unet.add_adapter(unet_lora_config)
         elif not self.unet_has_adapter:
             target_modules_unet = []
+
 
         unet.to(self.device)
         vae.to(self.device)
@@ -458,7 +543,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
             self.vae_enc = VAE_encode(vae, vae_b2a=vae_inv)
             self.vae_dec = VAE_decode(vae, vae_b2a=vae_inv)
 
-        if self.model_type != "sd3":
+        if self.model_type not in ["sd3","flux"]:
             self.timesteps = torch.tensor([999], device=self.device).long()
         else:
             self.timesteps = torch.tensor([1000], device=self.device).float()
@@ -470,6 +555,8 @@ class Pix2Pix_Turbo(torch.nn.Module):
         self.lora_rank_vae = lora_rank_vae
         self.target_modules_vae = target_modules_vae
         self.target_modules_unet = target_modules_unet
+
+        print("finished loading")
 
     def set_eval(self):
         self.unet.eval()
@@ -487,7 +574,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
                 layers_to_opt.append(_p)
 
         # For SD (not sd3) also train conv_in
-        if not self.model_type == "sd3":
+        if not self.model_type in ["sd3","flux"]:
             layers_to_opt += list(self.unet.conv_in.parameters())
 
         for n, _p in self.vae.named_parameters():
@@ -528,7 +615,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
             if "lora" in n or self.lora_rank_unet == 0:
                 _p.requires_grad = True
 
-        if not self.model_type == "sd3":
+        if not self.model_type in ["sd3","flux"]:
             self.unet.conv_in.requires_grad_(True)
 
         if not self.freeze_vae:
@@ -910,6 +997,224 @@ class Pix2Pix_Turbo(torch.nn.Module):
             "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
         }
 
+    # ------------------------------------------------------------------------
+    # FLUX prompt encoding
+    # ------------------------------------------------------------------------
+
+    def _get_t5_prompt_embeds_flux(
+        self,
+        prompt: Union[str, List[str]] = None,
+        num_images_per_prompt: int = 1,
+        max_sequence_length: int = 512,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        device = self.device
+        dtype = dtype or self.text_encoder.dtype
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        batch_size = len(prompt)
+
+
+        text_inputs = self.tokenizer_2(
+            prompt,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_length=False,
+            return_overflowing_tokens=False,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+        untruncated_ids = self.tokenizer_2(prompt, padding="longest", return_tensors="pt").input_ids
+
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+            removed_text = self.tokenizer_2.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
+            print(
+                "The following part of your input was truncated because `max_sequence_length` is set to "
+                f" {max_sequence_length} tokens: {removed_text}"
+            )
+
+        prompt_embeds = self.text_encoder_2(text_input_ids.to(device), output_hidden_states=False)[0]
+
+        dtype = self.text_encoder_2.dtype
+        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+
+        _, seq_len, _ = prompt_embeds.shape
+
+        # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+        return prompt_embeds
+
+    def _get_clip_prompt_embeds_flux(
+        self,
+        prompt: Union[str, List[str]],
+        num_images_per_prompt: int = 1,
+        device: Optional[torch.device] = None,
+    ):
+        device = self.device
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        batch_size = len(prompt)
+
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.tokenizer_max_length,
+            truncation=True,
+            return_overflowing_tokens=False,
+            return_length=False,
+            return_tensors="pt",
+        )
+
+        text_input_ids = text_inputs.input_ids
+        untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+            removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
+            print(
+                "The following part of your input was truncated because CLIP can only handle sequences up to"
+                f" {self.tokenizer_max_length} tokens: {removed_text}"
+            )
+        prompt_embeds = self.text_encoder(text_input_ids.to(device), output_hidden_states=False)
+
+        # Use pooled output of CLIPTextModel
+        prompt_embeds = prompt_embeds.pooler_output
+        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
+
+        # duplicate text embeddings for each generation per prompt, using mps friendly method
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, -1)
+
+        return prompt_embeds
+    
+    def encode_prompt_flux(
+        self,
+        prompt: Union[str, List[str]],
+        prompt_2: Optional[Union[str, List[str]]] = None,
+        device: Optional[torch.device] = None,
+        num_images_per_prompt: int = 1,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        max_sequence_length: int = 512,
+        negative_prompt=None, # compatibility
+        guidance_scale = None, # compatibility
+        lora_scale: Optional[float] = None,
+    ):
+        r"""
+
+        Args:
+            prompt (`str` or `List[str]`, *optional*):
+                prompt to be encoded
+            prompt_2 (`str` or `List[str]`, *optional*):
+                The prompt or prompts to be sent to the `tokenizer_2` and `text_encoder_2`. If not defined, `prompt` is
+                used in all text-encoders
+            device: (`torch.device`):
+                torch device
+            num_images_per_prompt (`int`):
+                number of images that should be generated per prompt
+            prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
+                provided, text embeddings will be generated from `prompt` input argument.
+            pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting.
+                If not provided, pooled text embeddings will be generated from `prompt` input argument.
+            lora_scale (`float`, *optional*):
+                A lora scale that will be applied to all LoRA layers of the text encoder if LoRA layers are loaded.
+        """
+        device = self.device 
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+
+        if prompt_embeds is None:
+            prompt_2 = prompt_2 or prompt
+            prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
+
+            # We only use the pooled prompt output from the CLIPTextModel
+            pooled_prompt_embeds = self._get_clip_prompt_embeds_flux(
+                prompt=prompt,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+            )
+            prompt_embeds = self._get_t5_prompt_embeds_flux(
+                prompt=prompt_2,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                device=device,
+            )
+
+        dtype = self.text_encoder.dtype if self.text_encoder is not None else self.unet.dtype
+        text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
+
+
+        return {
+            "prompt_embeds": prompt_embeds,  
+            "negative_prompt_embeds": None,
+            "pooled_prompt_embeds": pooled_prompt_embeds,
+            "negative_pooled_prompt_embeds": None,
+            "text_ids": text_ids
+        }
+
+    @staticmethod
+    def _pack_latents_flux(latents, batch_size, num_channels_latents, height, width):
+        latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+        latents = latents.permute(0, 2, 4, 1, 3, 5)
+        latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+
+        return latents
+
+    def _unpack_latents_flux(self,latents, height, width):
+        batch_size, num_patches, channels = latents.shape
+
+        # VAE applies 8x compression on images but we must also account for packing which requires
+        # latent height and width to be divisible by 2.
+
+        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
+        latents = latents.permute(0, 3, 1, 4, 2, 5)
+
+        latents = latents.reshape(batch_size, channels // (2 * 2), height, width)
+
+        return latents
+    
+    @staticmethod
+    def _prepare_latent_image_ids_flux(batch_size, height, width, device, dtype):
+        latent_image_ids = torch.zeros(height, width, 3)
+        latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
+        latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
+
+        latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
+
+        latent_image_ids = latent_image_ids.reshape(
+            latent_image_id_height * latent_image_id_width, latent_image_id_channels
+        )
+
+        return latent_image_ids.to(device=device, dtype=dtype)
+
+
+    def prepare_latents_flux(
+        self,
+        batch_size,
+        num_channels_latents,
+        height,
+        width,
+        dtype,
+        device,
+        latents=None,
+    ):
+        # VAE applies 8x compression on images but we must also account for packing which requires
+        # latent height and width to be divisible by 2.
+        #height = 2 * (int(height) // (self.vae_scale_factor * 2))
+        #width = 2 * (int(width) // (self.vae_scale_factor * 2))
+
+        shape = (batch_size, num_channels_latents, height, width)
+
+        latents = self._pack_latents_flux(latents, batch_size, num_channels_latents, height, width)
+
+        latent_image_ids = self._prepare_latent_image_ids_flux(batch_size, height // 2, width // 2, device, dtype)
+
+        return latents, latent_image_ids
+    
     # --------------------------------------------------------------------------------
     # FORWARD CYCLE 
     # --------------------------------------------------------------------------------
@@ -960,6 +1265,63 @@ class Pix2Pix_Turbo(torch.nn.Module):
             )[0]
             x_out = x_conc - model_pred
 
+        elif self.model_type == "flux":
+
+            guidance_scale =3.5
+
+            prompt_embeds = text_emb["prompt_embeds"]
+            pooled_prompt_embeds = text_emb["pooled_prompt_embeds"]
+
+            num_images_per_prompt=1
+            batch_size, num_channels_latents, height, width = x_conc.shape
+
+            latents = (x_conc * self.vae.config.scaling_factor - self.vae.config.shift_factor)
+
+            latents, latent_image_ids = self.prepare_latents_flux(
+                    batch_size * num_images_per_prompt,
+                    num_channels_latents,
+                    height,
+                    width,
+                    prompt_embeds.dtype,
+                    x_conc.device,
+                    latents,
+                )
+            
+            t_tensor = self.timesteps.expand(latents.size(0)).to(latents.dtype)/1000 #multiplied in transformer by 1000 
+
+            text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
+
+            #if self.unet.config.guidance_embeds: <- attribute not available in distributed training
+            guidance = torch.full([1], guidance_scale, device=x_conc.device, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+            #else:
+                #guidance = None
+
+            out = self.unet(
+                    hidden_states=latents.to(self.unet.device),
+                    timestep=t_tensor.to(self.unet.device),
+                    pooled_projections=pooled_prompt_embeds.to(self.unet.device),
+                    encoder_hidden_states=prompt_embeds.to(self.unet.device),
+                    return_dict=False,
+                    img_ids=latent_image_ids.to(self.unet.device),
+                    txt_ids=text_ids.to(self.unet.device),
+                    guidance=guidance.to(self.unet.device),
+                )
+            model_pred = out[0]
+
+            latents = latents - model_pred  
+
+            # "unpack"
+            latents = self._unpack_latents_flux(latents, height, width)
+
+            # scale+shift => decode
+            x_out = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            if self.has_skips:
+                self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
+            #output_image = self.vae.decode(latents, return_dict=False)[0]
+            #output_image = output_image.clamp(-1, 1)
+
+
         x_out_decoded = self.vae_dec(x_out, direction=direction, has_skips=self.has_skips)
         return x_out_decoded
 
@@ -988,6 +1350,10 @@ class Pix2Pix_Turbo(torch.nn.Module):
         Forward pass. Uses self.prompt_encoder to encode text (SD, SDXL, or SD3).
         Then feeds to unet, does one schedule step, and decodes result with VAE.
         """
+
+        if getattr(self, "model_type", None) == "flux" and guidance_scale == 0:
+            guidance_scale = 3.5
+
         if self.unpaired:
             raise NotImplementedError("It is not implemented to call the forward function for unpaired tasks yet. Use forward_cycle instead")
         B = c_t.shape[0]
@@ -1004,6 +1370,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
         negative_prompt_embeds = text_emb_dict["negative_prompt_embeds"]  
         pooled_prompt_embeds = text_emb_dict["pooled_prompt_embeds"]
         negative_pooled_prompt_embeds = text_emb_dict["negative_pooled_prompt_embeds"]
+
 
         # 2) ENCODE CONTROL (VAE) 
         # -----------------------------------------------------
@@ -1025,69 +1392,107 @@ class Pix2Pix_Turbo(torch.nn.Module):
         # For classifier-free guidance in SDXL we typically cat the unconditional 
         # embeddings. We'll handle that inside the call below.
         # -----------------------------------------------------
-        if self.model_type == "sd" or self.model_type == "sd3":
-            encoded_control_conc = encoded_control_net  # no direct duplication
-        else:
-            # sdxl
-            if negative_prompt is not None:
-                # we have uncond + cond
-                # so we must do the same duplication for latent
-                encoded_control_conc = torch.cat([encoded_control_net] * 2)
-            else:
-                encoded_control_conc = encoded_control_net
-
-        # 3) PREDICT NOISE / UPDATE LATENTS
-        # -----------------------------------------------------
         if self.model_type == "sd":
-            model_pred = self.unet(encoded_control_conc, self.timesteps, encoder_hidden_states=prompt_embeds).sample
+            # same as your existing code for "sd"
+            model_pred = self.unet(encoded_control_net, self.timesteps, encoder_hidden_states=prompt_embeds).sample
             x_denoised = self.sched.step(model_pred, self.timesteps, encoded_control_net, return_dict=True).prev_sample
+            # decode
+            if self.has_skips:
+                self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
+            output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
 
         elif self.model_type == "sdxl":
+            # same as your existing code for "sdxl"
             add_time_ids = self._get_add_time_ids(c_t.size()[-2:], [0, 0], c_t.size()[-2:], c_t.dtype)
             add_time_ids = add_time_ids.to(self.device).repeat(c_t.size()[0], 1)
-            # If we did unconditional+conditional, then we must do the same cat for time_ids
+            # If negative_prompt is given, we do uncond + cond cat
             if negative_prompt is not None:
+                encoded_control_net = torch.cat([encoded_control_net] * 2)
                 add_time_ids = torch.cat([add_time_ids, add_time_ids], dim=0)
-
-            # pass in the 'added_cond_kwargs'
-            added_cond_kwargs = {
-                "text_embeds": pooled_prompt_embeds,
-                "time_ids": add_time_ids,
-            }
-            noise_pred = self.unet(encoded_control_conc, self.timesteps, encoder_hidden_states=prompt_embeds, added_cond_kwargs=added_cond_kwargs).sample
-
+                prompt_embeds_combined = prompt_embeds
+            else:
+                prompt_embeds_combined = prompt_embeds
+            added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}
+            noise_pred = self.unet(encoded_control_net, self.timesteps, encoder_hidden_states=prompt_embeds_combined, added_cond_kwargs=added_cond_kwargs).sample
             if negative_prompt is not None:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 model_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
             else:
                 model_pred = noise_pred
-
-            x_denoised = self.sched.step(model_pred, self.timesteps, encoded_control_net, return_dict=True).prev_sample
+            x_denoised = self.sched.step(model_pred, self.timesteps, encoded_control, return_dict=True).prev_sample
+            if self.has_skips:
+                self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
+            output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
 
         elif self.model_type == "sd3":
-            
+            # same as your existing code for "sd3"
             model_pred = self.unet(
-                hidden_states=encoded_control,
+                hidden_states=encoded_control_net,
                 timestep=self.timesteps,
                 encoder_hidden_states=prompt_embeds,
                 pooled_projections=pooled_prompt_embeds,
                 return_dict=False,
             )[0]
-            x_denoised = encoded_control - model_pred
-
-        # 4) DECODE result
-        # -----------------------------------------------------
-        if self.has_skips and not self.unpaired:
-            self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
-
-        if self.unpaired:
-            # do the step individually for each batch element
-            x_out = torch.stack(
-                [self.sched.step(model_pred[i], self.timesteps, encoded_control[i], return_dict=True).prev_sample for i in range(B)]
-            )
-            output_image = self.vae_dec(x_out, direction=direction, has_skips=self.has_skips)
-        else:
+            x_denoised = encoded_control_net - model_pred
+            if self.has_skips:
+                self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
             output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
+
+        elif self.model_type == "flux":
+
+            num_images_per_prompt=1
+            batch_size, num_channels_latents, height, width = encoded_control_net.shape
+
+            latents = (encoded_control_net * self.vae.config.scaling_factor - self.vae.config.shift_factor)
+
+            latents, latent_image_ids = self.prepare_latents_flux(
+                    batch_size * num_images_per_prompt,
+                    num_channels_latents,
+                    height,
+                    width,
+                    prompt_embeds.dtype,
+                    c_t.device,
+                    latents,
+                )
+            
+
+            t_tensor = self.timesteps.expand(latents.size(0)).to(latents.dtype)/1000 #multiplied in transformer by 1000 
+
+
+            text_ids = text_emb_dict["text_ids"]
+
+            #if self.unet.config.guidance_embeds:  <- attribute not available in distributed training
+            guidance = torch.full([1], guidance_scale, device=c_t.device, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+            #else:
+                #guidance = None
+
+            out = self.unet(
+                    hidden_states=latents.to(self.unet.device),
+                    timestep=t_tensor.to(self.unet.device),
+                    pooled_projections=pooled_prompt_embeds.to(self.unet.device),
+                    encoder_hidden_states=prompt_embeds.to(self.unet.device),
+                    return_dict=False,
+                    img_ids=latent_image_ids.to(self.unet.device),
+                    txt_ids=text_ids.to(self.unet.device),
+                    guidance=guidance.to(self.unet.device),
+                )
+            model_pred = out[0]
+
+            latents = latents - model_pred  
+
+            # "unpack"
+            latents = self._unpack_latents_flux(latents, height, width)
+
+            # scale+shift => decode
+            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            if self.has_skips:
+                self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
+            output_image = self.vae.decode(latents, return_dict=False)[0]
+            output_image = output_image.clamp(-1, 1)
+
+        else:
+            raise ValueError(f"Unsupported model_type: {self.model_type}")
 
         return output_image
 
