@@ -58,19 +58,13 @@ def main(args):
 
     weight_dtype = torch.float32
 
-    if args.no_diffaug:
-        diffaug = False
-    else: 
-        diffaug = True
-
     if args.gan_disc_type == "vagan_clip":
-        net_disc_a = vision_aided_loss.Discriminator(cv_type=args.cv_type, loss_type=args.gan_loss_type, diffaug=diffaug, device=accelerator.device)
+        net_disc_a = vision_aided_loss.Discriminator(cv_type=args.cv_type, loss_type=args.gan_loss_type, device=accelerator.device)
         net_disc_a.cv_ensemble.requires_grad_(False)  # Freeze feature extractor
-        net_disc_b = vision_aided_loss.Discriminator(cv_type=args.cv_type, loss_type=args.gan_loss_type, diffaug=diffaug, device=accelerator.device)
+        net_disc_b = vision_aided_loss.Discriminator(cv_type=args.cv_type, loss_type=args.gan_loss_type, device=accelerator.device)
         net_disc_b.cv_ensemble.requires_grad_(False)  # Freeze feature extractor
     else:
         raise NotImplementedError(f"Discriminator type {args.gan_disc_type} not implemented")
-
 
     crit_cycle, crit_idt = torch.nn.L1Loss(), torch.nn.L1Loss()
 
