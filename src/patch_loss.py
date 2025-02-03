@@ -26,6 +26,8 @@ def compute_patched_disc_loss(net_disc, image, disc_args, args):
     image_resized = F.interpolate(image, size=(new_size, new_size), mode='bilinear', align_corners=False)
     # Compute loss on the complete (resized) image
     complete_loss = net_disc(image_resized, **disc_args).mean()
+    if factor <= 1:
+        return complete_loss
     patch_losses = []
     patch_size = max_pixels
     # Divide into patches and compute the loss on each patch.
@@ -64,6 +66,8 @@ def compute_patched_lpips_loss(net_lpips, image_pred, image_target, args):
     target_resized = F.interpolate(image_target, size=(new_size, new_size), mode='bilinear', align_corners=False)
     # Compute LPIPS on the complete image.
     complete_loss = net_lpips(pred_resized, target_resized).mean()
+    if factor <= 1:
+        return complete_loss
     patch_losses = []
     patch_size = max_pixels
     # Process each patch.

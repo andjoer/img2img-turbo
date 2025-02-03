@@ -13,7 +13,7 @@ Below is an overview of each file, their functions, and the command-line paramet
 ---
 
 ## Project status
-There are still left-overs from the original code that are not needed anymore. Some refactor still needs to be done. It is possible to train on MPS, but the GAN works different, which is why the cyclegan does not converge. The problem is the discriminator. If the first conv layer of the discriminator is put on cpu it works, which is done now by the function "prepare_disc"
+There are still left-overs from the original code that are not needed anymore. Some refactor still needs to be done. It is possible to train on MPS, but the GAN works different, which is why the cyclegan does not converge. The problem is the discriminator. If the first conv layer of the discriminator is put on cpu it works, which is done now by the function "prepare_disc". For higher resolution training width fine details it is possible to use the discriminator in patches.
 
 ---
 
@@ -28,6 +28,7 @@ There are still left-overs from the original code that are not needed anymore. S
 ├── my_utils/dino_struct.py    # extracts multi-scale transformer features from a DINO ViT mode
 ├── inference_paired.py        # inference script for a pretrained model trained with paired data
 ├── inference_unpaired.py      # inference script for a pretrained model trained with unpaired data
+├── patch_loss.py              # calculating the disc and lpips loss based on the complete and patched image
 └── ...
 ```
 
@@ -159,8 +160,10 @@ Below is a summary of **paired**-training arguments from `parse_args_paired_trai
 | **--allow_tf32**                         | bool    | False   | Allow TF32 on Ampere GPUs for speed.                                                                                                                                                                                                                                                                                                             |
 | **--report_to**                          | str     | `wandb` | Logging destination. Options: `tensorboard`, `wandb`, `comet_ml`, `all`.                                                                                                                                                                                                                                                                           |
 | **--enable_xformers_memory_efficient_attention** | bool | False   | Use xFormers memory-efficient attention.                                                                                                                                                                                                                                                                                                          |
-| **--set_grads_to_none**                  | bool    | False   | Sets grads to `None` instead of zero for possible performance gains.                                                                                                                                                                                                                                                                              |
-
+| **--set_grads_to_none**                  | bool    | False   | Sets grads to `None` instead of zero for possible performance gains.                                                                                                                                                                                                  |
+| **--num_patches**                          | int    | 1                | **New parameter.** Number of patches per side for patch-based processing (see below).                                                                                                                                            |
+| **--lambda_disc_complete**                 | float  | 2                | **New parameter.** Weight for the discriminator loss computed on the complete (resized) image.                                                                                                                                    |
+| **--lambda_lpips_complete**                | float  | 2                | **New parameter.** Weight for the LPIPS loss computed on the complete (resized) image.                                                                                                                                           |
 ---
 
 ## 3. `train_cyclegan_turbo.py`
@@ -244,11 +247,53 @@ Below is a summary of **unpaired**-training arguments from `parse_args_unpaired_
 | **--lambda_idt**                         | float   | 1.0     | Weight for identity loss (cycleGAN style).                                                                                                                                                                                                                                                                 |
 | **--lambda_cycle**                       | float   | 1.0     | Weight for cycle-consistency loss.                                                                                                                                                                                                                                                                          |
 | **--lambda_cycle_lpips**                 | float   | 10.0    | Weight for cycle-consistency LPIPS loss.                                                                                                                                                                                                                                                                    |
-| **--lambda_idt_lpips**                   | float   | 1.0     | Weight for identity LPIPS loss.                                                                                                                                                                                                                                                                             |
+| **--lambda_idt_lpips**                   | float   | 1.0     | Weight for identity LPIPS loss                                                                                                                                                                                                  |
+| **--num_patches**                          | int    | 1                | **New parameter.** Number of patches per side for patch-based processing (see below).                                                                                                                                            |
+| **--lambda_disc_complete**                 | float  | 2                | **New parameter.** Weight for the discriminator loss computed on the complete (resized) image.                                                                                                                                    |
+| **--lambda_lpips_complete**                | float  | 2                | **New parameter.** Weight for the LPIPS loss computed on the complete (resized) image.                                                                                                                                           |                                                                                                                                                                                                                                                                             |
 
 ---
 
-## 4. `training_utils.py`
+## 4. Patch-Based Loss Computation for High-Resolution Images
+
+To better handle high-resolution images, this repository now supports **patch-based loss computation** for both the discriminator and the LPIPS loss. This functionality is particularly useful when the input image size exceeds the maximum patch dimensions.
+
+### How It Works
+
+1. **Dynamic Resizing**:  
+   - For the **discriminator**, if the image resolution is higher than 224×224 pixels, the image is resized to a new size that is a multiple of 224.  
+   - For **LPIPS**, the maximum patch size is 512×512 pixels.  
+   - The resizing ensures that the image can be divided evenly into non-overlapping patches.
+
+2. **Loss Computation**:  
+   - **Complete Image Loss**: The loss is first computed on the entire resized image.
+   - **Patch Losses**: The image is then divided into a grid of patches. The number of patches per side is determined by the parameter `--num_patches` (with a computed factor based on the original image size, capped by `num_patches`).
+   - Each patch is forwarded through the network (discriminator or LPIPS) to compute its individual loss.
+   - The final loss is calculated as a weighted average:  
+     - For the discriminator:  
+       ```python
+       final_loss = (lambda_disc_complete * complete_loss + sum(patch_losses)) / (num_patches_total + lambda_disc_complete)
+       ```
+     - For LPIPS:  
+       ```python
+       final_loss = (lambda_lpips_complete * complete_loss + sum(patch_losses)) / (num_patches_total + lambda_lpips_complete)
+       ```
+     Here, `num_patches_total` is the total number of patches extracted.
+
+3. **User-Configurable Parameters**:  
+   - **`--num_patches`**: Sets the maximum number of patches per side. If the image size requires more patches, it is capped by this value.
+   - **`--lambda_disc_complete`**: Adjusts the weight of the complete image loss for the discriminator.
+   - **`--lambda_lpips_complete`**: Adjusts the weight of the complete image loss for LPIPS.
+
+The patch-based processing is implemented in the functions:
+- `compute_patched_disc_loss(net_disc, image, disc_args, args)`
+- `compute_patched_lpips_loss(net_lpips, image_pred, image_target, args)`
+
+These functions automatically determine the number of patches to use based on the image dimensions and the provided parameters.
+
+---
+
+## 5. `training_utils.py`
 
 A helper file containing:
 - **Argument parsing** functions:
