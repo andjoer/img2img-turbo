@@ -292,7 +292,7 @@ def main(args):
     if "mps" in str(accelerator.device):
         from prepare_disc import prepare_cv_ensamble_mps
         net_disc_a = prepare_cv_ensamble_mps(args.cv_type, net_disc_a)
-        net_disc_a = prepare_cv_ensamble_mps(args.cv_type, net_disc_a)
+        net_disc_b = prepare_cv_ensamble_mps(args.cv_type, net_disc_b)
     #####################################
 
     first_epoch = 0
