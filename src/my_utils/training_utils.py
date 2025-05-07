@@ -41,7 +41,11 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--lambda_gan", default=0.5, type=float)
     parser.add_argument("--lambda_lpips", default=5, type=float)
     parser.add_argument("--lambda_l2", default=1.0, type=float)
-    parser.add_argument("--lambda_clipsim", default=5.0, type=float)
+    parser.add_argument("--lambda_clipsim", default=5.0, type=float) 
+    parser.add_argument("--lambda_disc_complete", default=2, type=float)
+    parser.add_argument("--lambda_lpips_complete", default=2, type=float)
+    parser.add_argument("--num_patches", default=1, type=int)  
+    parser.add_argument("--no_diffaug", action="store_true")   #no differential augmentation in discriminator, for example for color sensitive tasks
 
     # dataset options
     parser.add_argument("--dataset_folder", required=True, type=str)
@@ -64,6 +68,7 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--pretrained_path", type=str, default=None)
     parser.add_argument("--out_model_name", type=str, default="test_model")
     parser.add_argument("--model_type", type=str, default="sd")
+    parser.add_argument("--mode", type=str, default="fill")
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--variant", type=str, default=None)
     parser.add_argument("--tokenizer_name", type=str, default=None)
@@ -76,6 +81,8 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--original_vae", action="store_true")
 
     # training details
+    parser.add_argument("--steps_with_reduced_noise", type=int, default=0)
+    parser.add_argument("--min_noise", type=float, default=0)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--cache_dir", default=None)
     parser.add_argument("--seed", type=int, default=None,
@@ -158,6 +165,10 @@ def parse_args_unpaired_training():
     parser.add_argument("--lambda_cycle", default=1, type=float)
     parser.add_argument("--lambda_cycle_lpips", default=10.0, type=float)
     parser.add_argument("--lambda_idt_lpips", default=1.0, type=float)
+    parser.add_argument("--lambda_disc_complete", default=2, type=float)
+    parser.add_argument("--lambda_lpips_complete", default=2, type=float)
+    parser.add_argument("--num_patches", default=1, type=int)
+    parser.add_argument("--no_diffaug", action="store_true")   #no differential augmentation in discriminator, for example for color sensitive tasks
 
     # args for dataset and dataloader
     parser.add_argument("--dataset_folder", required=True, type=str)
@@ -179,6 +190,7 @@ def parse_args_unpaired_training():
     parser.add_argument("--pretrained_path", type=str, default=None)
     parser.add_argument("--out_model_name", type=str, default="test_model")
     parser.add_argument("--model_type", type=str, default="sd")
+    parser.add_argument("--mode", type=str, default="fill") 
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--variant", type=str, default=None)
     parser.add_argument("--tokenizer_name", type=str, default=None)
@@ -202,6 +214,9 @@ def parse_args_unpaired_training():
     parser.add_argument("--checkpointing_steps", type=int, default=500)
 
     # args for optimization
+    parser.add_argument("--steps_with_reduced_noise", type=int, default=0)
+    parser.add_argument("--steps_with_idt_only", type=int, default=0)
+    parser.add_argument("--min_noise", type=float, default=0)
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--adam_beta1", type=float, default=0.9,
                         help="The beta1 parameter for the Adam optimizer.")
